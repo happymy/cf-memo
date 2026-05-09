@@ -148,6 +148,7 @@ export default {
       if (path.startsWith('/api/memos/')) {
         const memoId = path.slice('/api/memos/'.length);
         if (!memoId) return json({ error: 'Missing memo id' }, 400);
+        if (method === 'GET') return handleGetMemo(memoId, env);
         if (method === 'PUT') return handleUpdateMemo(request, memoId, env);
         if (method === 'DELETE') return handleDeleteMemo(memoId, env);
       }
@@ -262,16 +263,20 @@ function handleLogout(request) {
 
 // ── 备忘录 CRUD ──────────────────────────────────────────────────
 async function handleListMemos(user, env) {
-  const list = await env.MEMOS_KV.list({ prefix: 'memo:' });
   const memos = [];
-  for (const key of list.keys) {
-    const raw = await env.MEMOS_KV.get(key.name);
-    if (raw) {
-      try {
-        memos.push(JSON.parse(raw));
-      } catch { /* 忽略损坏数据 */ }
+  let cursor;
+  do {
+    const list = await env.MEMOS_KV.list({ prefix: 'memo:', cursor: cursor, limit: 1000 });
+    for (const key of list.keys) {
+      const raw = await env.MEMOS_KV.get(key.name);
+      if (raw) {
+        try {
+          memos.push(JSON.parse(raw));
+        } catch { /* 忽略损坏数据 */ }
+      }
     }
-  }
+    cursor = list.list_complete ? undefined : list.cursor;
+  } while (cursor);
   // 按更新时间倒序
   memos.sort((a, b) => b.updatedAt - a.updatedAt);
   return json(memos, 200, { 'Cache-Control': 'no-store' });
@@ -368,6 +373,20 @@ async function handleDeleteMemo(memoId, env) {
   }
   await env.MEMOS_KV.delete('memo:' + memoId);
   return json({ ok: true });
+}
+
+async function handleGetMemo(memoId, env) {
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(memoId)) {
+    return json({ error: 'Invalid memo id' }, 400);
+  }
+  const raw = await env.MEMOS_KV.get('memo:' + memoId);
+  if (!raw) return json({ error: 'Memo not found' }, 404);
+  try {
+    const memo = JSON.parse(raw);
+    return json(memo);
+  } catch {
+    return json({ error: 'Memo data corrupted' }, 500);
+  }
 }
 
 // ── 安全响应头 ──────────────────────────────────────────────────
@@ -542,7 +561,7 @@ function serveAppPage() {
   h.push('  .btn-logout { background: #eee; color: #555; }');
   h.push('  .btn-logout:hover { background: #ddd; }');
   h.push('  .container {');
-  h.push('    max-width: 720px;');
+  h.push('    max-width: 900px;');
   h.push('    margin: 24px auto;');
   h.push('    padding: 0 16px;');
   h.push('  }');
@@ -593,7 +612,7 @@ function serveAppPage() {
   h.push('    border-radius: 14px;');
   h.push('    padding: 28px 24px;');
   h.push('    width: 90%;');
-  h.push('    max-width: 480px;');
+  h.push('    max-width: 600px;');
   h.push('    box-shadow: 0 20px 50px rgba(0,0,0,0.2);');
   h.push('  }');
   h.push('  .modal h2 { margin-bottom: 18px; font-size: 18px; }');
@@ -608,7 +627,7 @@ function serveAppPage() {
   h.push('    font-size: 14px;');
   h.push('    font-family: inherit;');
   h.push('  }');
-  h.push('  .modal .field textarea { resize: vertical; min-height: 100px; }');
+  h.push('  .modal .field textarea { resize: vertical; min-height: 160px; max-height: 500px; }');
   h.push('  .modal .field input:focus,');
   h.push('  .modal .field textarea:focus { outline: none; border-color: #667eea; }');
   h.push('  .char-count { text-align: right; font-size: 12px; color: #aaa; margin-top: 4px; }');
@@ -628,6 +647,36 @@ function serveAppPage() {
   h.push('  .btn-cancel:hover { background: #ddd; }');
   h.push('  .btn-delete-inline { background: #e74c3c; color: #fff; margin-right: auto; }');
   h.push('  .btn-delete-inline:hover { background: #c0392b; }');
+  h.push('  .memo-card h3, .memo-card p { overflow-wrap: break-word; word-break: break-word; }');
+  h.push('  .btn-theme { background: none; border: 1px solid #ddd; color: #888; font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 6px; line-height: 1; }');
+  h.push('  .btn-theme:hover { background: #f0f0f0; }');
+  h.push('  [data-theme="dark"] .btn-theme { border-color: #3a3a5a; color: #909090; }');
+  h.push('  [data-theme="dark"] .btn-theme:hover { background: #2a2a4a; }');
+  h.push('  [data-theme="dark"] body { background: #1a1a2e; color: #e0e0e0; }');
+  h.push('  [data-theme="dark"] .header { background: #16213e; border-color: #2a2a4a; }');
+  h.push('  [data-theme="dark"] .header h1 { color: #e0e0e0; }');
+  h.push('  [data-theme="dark"] .header .user { color: #909090; }');
+  h.push('  [data-theme="dark"] .btn-logout { background: #2a2a4a; color: #b0b0b0; }');
+  h.push('  [data-theme="dark"] .btn-logout:hover { background: #3a3a5a; }');
+  h.push('  [data-theme="dark"] .memo-card { background: #16213e; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }');
+  h.push('  [data-theme="dark"] .memo-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.5); }');
+  h.push('  [data-theme="dark"] .memo-card h3 { color: #e0e0e0; }');
+  h.push('  [data-theme="dark"] .memo-card p { color: #b0b0b0; }');
+  h.push('  [data-theme="dark"] .memo-card .time { color: #707070; }');
+  h.push('  [data-theme="dark"] .card-actions button { color: #909090; }');
+  h.push('  [data-theme="dark"] .card-actions button:hover { background: #2a2a4a; color: #e0e0e0; }');
+  h.push('  [data-theme="dark"] .modal { background: #16213e; box-shadow: 0 20px 50px rgba(0,0,0,0.5); }');
+  h.push('  [data-theme="dark"] .modal h2 { color: #e0e0e0; }');
+  h.push('  [data-theme="dark"] .modal .field label { color: #b0b0b0; }');
+  h.push('  [data-theme="dark"] .modal .field input,');
+  h.push('  [data-theme="dark"] .modal .field textarea { background: #1a1a2e; color: #e0e0e0; border-color: #3a3a5a; }');
+  h.push('  [data-theme="dark"] .modal .field input:focus,');
+  h.push('  [data-theme="dark"] .modal .field textarea:focus { border-color: #667eea; }');
+  h.push('  [data-theme="dark"] .btn-cancel { background: #2a2a4a; color: #b0b0b0; }');
+  h.push('  [data-theme="dark"] .btn-cancel:hover { background: #3a3a5a; }');
+  h.push('  [data-theme="dark"] .char-count { color: #707070; }');
+  h.push('  [data-theme="dark"] .empty { color: #707070; }');
+  h.push('  [data-theme="dark"] .modal-overlay { background: rgba(0,0,0,0.7); }');
   h.push('</style>');
   h.push('</head>');
   h.push('<body>');
@@ -636,6 +685,7 @@ function serveAppPage() {
   h.push('  <div class="actions">');
   h.push('    <span class="user" id="usernameDisplay"></span>');
   h.push('    <button class="btn-new" id="newMemoBtn">\u{FF0B} 新建</button>');
+  h.push('    <button class="btn-theme" id="themeToggle" title="切换深色模式">🌙</button>');
   h.push('    <button class="btn-logout" id="logoutBtn">退出</button>');
   h.push('  </div>');
   h.push('</div>');
@@ -688,47 +738,48 @@ function serveAppPage() {
   h.push('');
   h.push('// ── 加载备忘录列表 ───');
   h.push('async function loadMemos() {');
-  h.push('  var container = document.getElementById("memoList");');
   h.push('  try {');
   h.push('    var res = await fetch("/api/memos");');
   h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
-  h.push('    var memos = await res.json();');
-  h.push('    memosCache = memos;');
-  h.push('    if (memos.length === 0) {');
-  h.push('      container.innerHTML = "<div class=\\"empty\\">还没有备忘录，点击右上角「新建」开始</div>";');
-  h.push('      return;');
-  h.push('    }');
-  h.push('    container.innerHTML = memos.map(function(m) {');
-  h.push('      var date = new Date(m.updatedAt).toLocaleString("zh-CN");');
-  h.push('      var card = "<div class=\\"memo-card\\">";');
-  h.push('      card += "<h3>" + escapeHtml(m.title || "(无标题)") + "</h3>";');
-  h.push('      if (m.content) {');
-  h.push('        card += "<p>" + escapeHtml(m.content) + "</p>";');
-  h.push('      } else {');
-  h.push('        card += "<p style=\\"color:#ccc;\\">无内容</p>";');
-  h.push('      }');
-  h.push('      card += "<div class=\\"time\\">更新于 " + date + "</div>";');
-  h.push('      card += "<div class=\\"card-actions\\">";');
-  h.push('      card += "<button title=\\"编辑\\" data-edit=\\"" + m.id + "\\">\u270F\uFE0F</button>";');
-  h.push('      card += "<button title=\\"删除\\" data-delete=\\"" + m.id + "\\">\uD83D\uDDD1\uFE0F</button>";');
-  h.push('      card += "</div>";');
-  h.push('      card += "</div>";');
-  h.push('      return card;');
-  h.push('    }).join("");');
-  h.push('');
-  h.push('    // 绑定事件');
-  h.push('    container.querySelectorAll("[data-edit]").forEach(function(btn) {');
-  h.push('      btn.addEventListener("click", function() { openEditModal(btn.dataset.edit); });');
-  h.push('    });');
-  h.push('    container.querySelectorAll("[data-delete]").forEach(function(btn) {');
-  h.push('      btn.addEventListener("click", function() { deleteMemoDirect(btn.dataset.delete); });');
-  h.push('    });');
+  h.push('    memosCache = await res.json();');
+  h.push('    renderMemoList();');
   h.push('  } catch(e) {');
-  h.push('    container.innerHTML = "<div class=\\"empty\\">加载失败，请刷新页面</div>";');
+  h.push('    document.getElementById("memoList").innerHTML = "<div class=\\"empty\\">加载失败，请刷新页面</div>";');
   h.push('  }');
-  h.push('}');
-  h.push('');
-  h.push('function escapeHtml(text) {');
+h.push('}');
+h.push('');
+h.push('function renderMemoList() {');
+h.push('  var container = document.getElementById("memoList");');
+h.push('  if (memosCache.length === 0) {');
+h.push('    container.innerHTML = "<div class=\\"empty\\">还没有备忘录，点击右上角「新建」开始</div>";');
+h.push('    return;');
+h.push('  }');
+h.push('  container.innerHTML = memosCache.map(function(m) {');
+h.push('    var date = new Date(m.updatedAt).toLocaleString("zh-CN");');
+h.push('    var card = "<div class=\\"memo-card\\">";');
+h.push('    card += "<h3>" + escapeHtml(m.title || "(无标题)") + "</h3>";');
+h.push('    if (m.content) {');
+h.push('      card += "<p>" + escapeHtml(m.content) + "</p>";');
+h.push('    } else {');
+h.push('      card += "<p style=\\"color:#ccc;\\">无内容</p>";');
+h.push('    }');
+h.push('    card += "<div class=\\"time\\">更新于 " + date + "</div>";');
+h.push('    card += "<div class=\\"card-actions\\">";');
+h.push('    card += "<button title=\\"编辑\\" data-edit=\\"" + m.id + "\\">\u270F\uFE0F</button>";');
+h.push('    card += "<button title=\\"删除\\" data-delete=\\"" + m.id + "\\">\uD83D\uDDD1\uFE0F</button>";');
+h.push('    card += "</div>";');
+h.push('    card += "</div>";');
+h.push('    return card;');
+h.push('  }).join("");');
+h.push('  container.querySelectorAll("[data-edit]").forEach(function(btn) {');
+h.push('    btn.addEventListener("click", function() { openEditModal(btn.dataset.edit); });');
+h.push('  });');
+h.push('  container.querySelectorAll("[data-delete]").forEach(function(btn) {');
+h.push('    btn.addEventListener("click", function() { deleteMemoDirect(btn.dataset.delete); });');
+h.push('  });');
+h.push('}');
+h.push('');
+h.push('function escapeHtml(text) {');
   h.push('  var div = document.createElement("div");');
   h.push('  div.textContent = text;');
   h.push('  return div.innerHTML;');
@@ -751,7 +802,7 @@ function serveAppPage() {
   h.push('');
   h.push('function autoResizeTextarea() {');
   h.push('  memoContent.style.height = "auto";');
-  h.push('  memoContent.style.height = Math.min(memoContent.scrollHeight, 400) + "px";');
+  h.push('  memoContent.style.height = Math.min(memoContent.scrollHeight, 500) + "px";');
   h.push('}');
   h.push('');
   h.push('memoContent.addEventListener("input", function() {');
@@ -788,10 +839,9 @@ function serveAppPage() {
   h.push('    memoContent.value = memo.content;');
   h.push('  } else {');
   h.push('    alert("该备忘录不存在或已被删除");');
-  h.push('    memoTitle.value = "";');
-  h.push('    memoContent.value = "";');
-  h.push('    editMemoId.value = "";');
-  h.push('    deleteBtn.style.display = "none";');
+  h.push('    closeModal();');
+  h.push('    loadMemos();');
+  h.push('    return;');
   h.push('  }');
   h.push('  modalOverlay.classList.add("active");');
   h.push('  updateCharCount();');
@@ -832,10 +882,22 @@ function serveAppPage() {
   h.push('        body: JSON.stringify({ title: title, content: content })');
   h.push('      });');
   h.push('    }');
-  h.push('    if (res.ok) {');
-  h.push('      closeModal();');
-  h.push('      loadMemos();');
-  h.push('    } else {');
+h.push('    if (res.ok) {');
+h.push('      var memo = await res.json();');
+h.push('      if (id) {');
+h.push('        for (var i = 0; i < memosCache.length; i++) {');
+h.push('          if (memosCache[i].id === id) {');
+h.push('            memosCache[i] = memo;');
+h.push('            break;');
+h.push('          }');
+h.push('        }');
+h.push('      } else {');
+h.push('        memosCache.push(memo);');
+h.push('        memosCache.sort(function(a,b){ return b.updatedAt - a.updatedAt; });');
+h.push('      }');
+h.push('      closeModal();');
+h.push('      renderMemoList();');
+h.push('    } else {');
   h.push('      var err = await res.json();');
   h.push('      alert(err.error || "保存失败");');
   h.push('    }');
@@ -852,9 +914,10 @@ function serveAppPage() {
   h.push('  if (!confirm("确定要删除这条备忘录吗？")) return;');
   h.push('  try {');
   h.push('    var res = await fetch("/api/memos/" + id, { method: "DELETE" });');
-  h.push('    if (res.ok) {');
-  h.push('      loadMemos();');
-  h.push('    } else {');
+h.push('    if (res.ok) {');
+h.push('      memosCache = memosCache.filter(function(m) { return m.id !== id; });');
+h.push('      renderMemoList();');
+h.push('    } else {');
   h.push('      alert("删除失败");');
   h.push('    }');
   h.push('  } catch(e) {');
@@ -873,7 +936,7 @@ function serveAppPage() {
   h.push('  var id = editMemoId.value;');
   h.push('  if (id && confirm("确定要删除这条备忘录吗？")) {');
   h.push('    fetch("/api/memos/" + id, { method: "DELETE" }).then(function(r) {');
-  h.push('      if (r.ok) { closeModal(); loadMemos(); }');
+h.push('      if (r.ok) { memosCache = memosCache.filter(function(m) { return m.id !== id; }); closeModal(); renderMemoList(); }');
   h.push('      else alert("删除失败");');
   h.push('    });');
   h.push('  }');
@@ -896,6 +959,27 @@ function serveAppPage() {
   h.push('    saveMemo();');
   h.push('  }');
   h.push('});');
+  h.push('');
+  h.push('// 深色模式');
+  h.push('(function(){');
+  h.push('  var theme = localStorage.getItem("theme") || "light";');
+  h.push('  if (theme === "dark") {');
+  h.push('    document.documentElement.setAttribute("data-theme", "dark");');
+  h.push('    document.getElementById("themeToggle").textContent = "\u2600\uFE0F";');
+  h.push('  }');
+  h.push('  document.getElementById("themeToggle").addEventListener("click", function() {');
+  h.push('    var current = document.documentElement.getAttribute("data-theme");');
+  h.push('    if (current === "dark") {');
+  h.push('      document.documentElement.removeAttribute("data-theme");');
+  h.push('      localStorage.setItem("theme", "light");');
+  h.push('      this.textContent = "\uD83C\uDF19";');
+  h.push('    } else {');
+  h.push('      document.documentElement.setAttribute("data-theme", "dark");');
+  h.push('      localStorage.setItem("theme", "dark");');
+  h.push('      this.textContent = "\u2600\uFE0F";');
+  h.push('    }');
+  h.push('  });');
+  h.push('})();');
   h.push('');
   h.push('init();');
   h.push('})();');
