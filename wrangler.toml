@@ -1,0 +1,21 @@
+name = "cf-memo"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# KV 命名空间 - 部署前需先创建
+# 运行: wrangler kv namespace create MEMOS_KV
+# 然后将输出的 id 替换下方的占位符
+kv_namespaces = [
+  { binding = "MEMOS_KV", id = "YOUR_KV_NAMESPACE_ID" }
+]
+
+# 环境变量 - 预设登录凭证和会话密钥
+# 部署时设置实际值:
+# wrangler secret put USERNAME
+# wrangler secret put PASSWORD
+# wrangler secret put SESSION_SECRET
+[vars]
+# 以下仅为本地开发使用，生产环境请用 wrangler secret 设置
+# USERNAME = "admin"
+# PASSWORD = "memo2024"
+# SESSION_SECRET = "your-random-secret-string-change-me"
