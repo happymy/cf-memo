@@ -211,7 +211,7 @@ async function handleLogin(request, env) {
   const storedPass = (env.PASSWORD || '').trim();
   const userMatch = constantTimeEqual(username, storedUser);
   const passMatch = constantTimeEqual(password, storedPass);
-  if (!userMatch || !passMatch) {
+  if (!userMatch | !passMatch) {
     try {
       await env.MEMOS_KV.put(rateLimitKey, String(attempts + 1), { expirationTtl: 900 });
     } catch { /* 忽略存储错误 */ }
@@ -351,7 +351,12 @@ async function handleUpdateMemo(request, memoId, env) {
     return json({ error: 'Content must be 20000 characters or less' }, 400);
   }
 
-  const old = JSON.parse(existing);
+  let old;
+  try {
+    old = JSON.parse(existing);
+  } catch {
+    return json({ error: 'Memo data corrupted' }, 500);
+  }
   const updated = {
     ...old,
     title: body.title !== undefined ? body.title.trim() : old.title,
@@ -830,8 +835,10 @@ h.push('function escapeHtml(text) {');
   h.push('  if (memos.length === 0) {');
   h.push('    try {');
   h.push('      var res = await fetch("/api/memos");');
-  h.push('      if (res.ok) memos = await res.json();');
-  h.push('    } catch(e) { /* 忽略 */ }');
+  h.push('      if (res.status === 401) { window.location.href = "/"; return; }');
+  h.push('      if (res.ok) { memos = await res.json(); memosCache = memos; }');
+  h.push('      else { alert("加载失败，请重试"); closeModal(); loadMemos(); return; }');
+  h.push('    } catch(e) { alert("网络错误，请重试"); closeModal(); loadMemos(); return; }');
   h.push('  }');
   h.push('  var memo = memos.find(function(m) { return m.id === id; });');
   h.push('  if (memo) {');
@@ -882,9 +889,10 @@ h.push('function escapeHtml(text) {');
   h.push('        body: JSON.stringify({ title: title, content: content })');
   h.push('      });');
   h.push('    }');
-h.push('    if (res.ok) {');
-h.push('      var memo = await res.json();');
-h.push('      if (id) {');
+  h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
+  h.push('    if (res.ok) {');
+  h.push('      var memo = await res.json();');
+  h.push('      if (id) {');
 h.push('        for (var i = 0; i < memosCache.length; i++) {');
 h.push('          if (memosCache[i].id === id) {');
 h.push('            memosCache[i] = memo;');
@@ -914,10 +922,11 @@ h.push('    } else {');
   h.push('  if (!confirm("确定要删除这条备忘录吗？")) return;');
   h.push('  try {');
   h.push('    var res = await fetch("/api/memos/" + id, { method: "DELETE" });');
-h.push('    if (res.ok) {');
-h.push('      memosCache = memosCache.filter(function(m) { return m.id !== id; });');
-h.push('      renderMemoList();');
-h.push('    } else {');
+  h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
+  h.push('    if (res.ok) {');
+  h.push('      memosCache = memosCache.filter(function(m) { return m.id !== id; });');
+  h.push('      renderMemoList();');
+  h.push('    } else {');
   h.push('      alert("删除失败");');
   h.push('    }');
   h.push('  } catch(e) {');
@@ -936,7 +945,8 @@ h.push('    } else {');
   h.push('  var id = editMemoId.value;');
   h.push('  if (id && confirm("确定要删除这条备忘录吗？")) {');
   h.push('    fetch("/api/memos/" + id, { method: "DELETE" }).then(function(r) {');
-h.push('      if (r.ok) { memosCache = memosCache.filter(function(m) { return m.id !== id; }); closeModal(); renderMemoList(); }');
+  h.push('      if (r.status === 401) { window.location.href = "/"; return; }');
+  h.push('      if (r.ok) { memosCache = memosCache.filter(function(m) { return m.id !== id; }); closeModal(); renderMemoList(); }');
   h.push('      else alert("删除失败");');
   h.push('    });');
   h.push('  }');
