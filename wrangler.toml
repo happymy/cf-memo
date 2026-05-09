@@ -3,7 +3,7 @@ main = "src/index.js"
 compatibility_date = "2025-01-01"
 
 # KV 命名空间 - 部署前需先创建
-# 运行: wrangler kv namespace create MEMOS_KV
+# 运行: wrangler kv ！namespace create MEMOS_KV
 # 然后将输出的 id 替换下方的占位符
 kv_namespaces = [
   { binding = "MEMOS_KV", id = "YOUR_KV_NAMESPACE_ID" }
