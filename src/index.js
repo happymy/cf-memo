@@ -93,7 +93,9 @@ async function verifySessionToken(token, secret) {
 
 // ── KV 数据格式 ─────────────────────────────────────────────────
 // Key:   memo:<id>
-// Value: JSON { id, title, content, createdAt, updatedAt }
+// Value: JSON { id, title, content, folderId?, createdAt, updatedAt }
+// Key:   folder:<id>
+// Value: JSON { id, name, createdAt }
 
 function genId() {
   return crypto.randomUUID();
@@ -138,6 +140,27 @@ export default {
       // 其他 API 需要认证
       if (!user) {
         return json({ error: 'Unauthorized' }, 401);
+      }
+
+      if (path === '/api/folders') {
+        if (method === 'GET') return handleListFolders(env);
+        if (method === 'POST') return handleCreateFolder(request, env);
+      }
+      if (path.startsWith('/api/folders/')) {
+        const parts = path.slice('/api/folders/'.length).split('/');
+        const folderId = parts[0];
+        if (!folderId) return json({ error: 'Missing folder id' }, 400);
+        if (parts.length === 1) {
+          if (method === 'PUT') return handleUpdateFolder(request, folderId, env);
+          if (method === 'DELETE') return handleDeleteFolder(folderId, env);
+        }
+      }
+
+      // 放在 /api/memos/:id 之前，避免路由抢先匹配
+      if (path.startsWith('/api/memos/') && path.endsWith('/folder')) {
+        const memoId = path.slice('/api/memos/'.length, -'/folder'.length);
+        if (!memoId) return json({ error: 'Missing memo id' }, 400);
+        if (method === 'PUT') return handleMoveMemo(request, memoId, env);
       }
 
       if (path === '/api/memos') {
@@ -290,7 +313,12 @@ async function handleCreateMemo(request, env) {
     return json({ error: 'Invalid JSON' }, 400);
   }
   
-  const { title, content } = body;
+  const { title, content, folderId } = body;
+  if (folderId !== undefined && folderId !== null) {
+    if (typeof folderId !== 'string' || !/^[a-zA-Z0-9_-]{1,40}$/.test(folderId)) return json({ error: 'Invalid folder id' }, 400);
+    const folderExists = await env.MEMOS_KV.get('folder:' + folderId);
+    if (!folderExists) return json({ error: 'Folder not found' }, 400);
+  }
   if (title !== undefined && typeof title !== 'string') {
     return json({ error: 'Title must be a string' }, 400);
   }
@@ -315,6 +343,7 @@ async function handleCreateMemo(request, env) {
     createdAt: now,
     updatedAt: now,
   };
+  if (folderId) memo.folderId = folderId;
 
   await env.MEMOS_KV.put('memo:' + memo.id, JSON.stringify(memo));
   return json(memo, 201);
@@ -350,6 +379,11 @@ async function handleUpdateMemo(request, memoId, env) {
   if (body.content !== undefined && body.content.length > 20000) {
     return json({ error: 'Content must be 20000 characters or less' }, 400);
   }
+  if (body.folderId !== undefined && body.folderId !== null) {
+    if (typeof body.folderId !== 'string' || !/^[a-zA-Z0-9_-]{1,40}$/.test(body.folderId)) return json({ error: 'Invalid folder id' }, 400);
+    const folderExists = await env.MEMOS_KV.get('folder:' + body.folderId);
+    if (!folderExists) return json({ error: 'Folder not found' }, 400);
+  }
 
   let old;
   try {
@@ -361,6 +395,7 @@ async function handleUpdateMemo(request, memoId, env) {
     ...old,
     title: body.title !== undefined ? body.title.trim() : old.title,
     content: body.content !== undefined ? body.content.trim() : old.content,
+    folderId: body.folderId !== undefined ? body.folderId : old.folderId,
     updatedAt: Date.now(),
   };
 
@@ -392,6 +427,112 @@ async function handleGetMemo(memoId, env) {
   } catch {
     return json({ error: 'Memo data corrupted' }, 500);
   }
+}
+
+// ── 文件夹 CRUD ──────────────────────────────────────────────────
+async function handleListFolders(env) {
+  const folders = [];
+  let cursor;
+  do {
+    const list = await env.MEMOS_KV.list({ prefix: 'folder:', cursor, limit: 1000 });
+    for (const key of list.keys) {
+      const raw = await env.MEMOS_KV.get(key.name);
+      if (raw) {
+        try { folders.push(JSON.parse(raw)); } catch { /* 忽略损坏数据 */ }
+      }
+    }
+    cursor = list.list_complete ? undefined : list.cursor;
+  } while (cursor);
+  folders.sort((a, b) => a.createdAt - b.createdAt);
+  return json(folders, 200, { 'Cache-Control': 'no-store' });
+}
+
+async function handleCreateFolder(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'Invalid JSON' }, 400); }
+  const { name } = body;
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return json({ error: 'Folder name is required' }, 400);
+  }
+  if (name.trim().length > 50) {
+    return json({ error: 'Folder name must be 50 characters or less' }, 400);
+  }
+  const folder = { id: genId(), name: name.trim(), createdAt: Date.now() };
+  await env.MEMOS_KV.put('folder:' + folder.id, JSON.stringify(folder));
+  return json(folder, 201);
+}
+
+async function handleUpdateFolder(request, folderId, env) {
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(folderId)) {
+    return json({ error: 'Invalid folder id' }, 400);
+  }
+  const existing = await env.MEMOS_KV.get('folder:' + folderId);
+  if (!existing) return json({ error: 'Folder not found' }, 404);
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'Invalid JSON' }, 400); }
+  const { name } = body;
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return json({ error: 'Folder name is required' }, 400);
+  }
+  if (name.trim().length > 50) {
+    return json({ error: 'Folder name must be 50 characters or less' }, 400);
+  }
+  const folder = { ...JSON.parse(existing), name: name.trim() };
+  await env.MEMOS_KV.put('folder:' + folderId, JSON.stringify(folder));
+  return json(folder);
+}
+
+async function handleDeleteFolder(folderId, env) {
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(folderId)) {
+    return json({ error: 'Invalid folder id' }, 400);
+  }
+  const existing = await env.MEMOS_KV.get('folder:' + folderId);
+  if (!existing) return json({ error: 'Folder not found' }, 404);
+  await env.MEMOS_KV.delete('folder:' + folderId);
+  // 清除该分类下所有备忘录的 folderId
+  let cursor;
+  do {
+    const list = await env.MEMOS_KV.list({ prefix: 'memo:', cursor, limit: 1000 });
+    for (const key of list.keys) {
+      const raw = await env.MEMOS_KV.get(key.name);
+      if (raw) {
+        try {
+          const memo = JSON.parse(raw);
+          if (memo.folderId === folderId) {
+            delete memo.folderId;
+            memo.updatedAt = Date.now();
+            await env.MEMOS_KV.put(key.name, JSON.stringify(memo));
+          }
+        } catch { /* 忽略损坏数据 */ }
+      }
+    }
+    cursor = list.list_complete ? undefined : list.cursor;
+  } while (cursor);
+  return json({ ok: true });
+}
+
+async function handleMoveMemo(request, memoId, env) {
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(memoId)) return json({ error: 'Invalid memo id' }, 400);
+  const existing = await env.MEMOS_KV.get('memo:' + memoId);
+  if (!existing) return json({ error: 'Memo not found' }, 404);
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'Invalid JSON' }, 400); }
+  const { folderId } = body;
+  if (folderId !== null && folderId !== undefined) {
+    if (typeof folderId !== 'string' || !/^[a-zA-Z0-9_-]{1,40}$/.test(folderId)) return json({ error: 'Invalid folder id' }, 400);
+    const folderExists = await env.MEMOS_KV.get('folder:' + folderId);
+    if (!folderExists) return json({ error: 'Folder not found' }, 404);
+  }
+  let memo;
+  try { memo = JSON.parse(existing); } catch { return json({ error: 'Memo data corrupted' }, 500); }
+  if (folderId === null || folderId === undefined) {
+    delete memo.folderId;
+  } else {
+    memo.folderId = folderId;
+  }
+  memo.updatedAt = Date.now();
+  await env.MEMOS_KV.put('memo:' + memoId, JSON.stringify(memo));
+  return json(memo);
 }
 
 // ── 安全响应头 ──────────────────────────────────────────────────
@@ -682,6 +823,88 @@ function serveAppPage() {
   h.push('  [data-theme="dark"] .char-count { color: #707070; }');
   h.push('  [data-theme="dark"] .empty { color: #707070; }');
   h.push('  [data-theme="dark"] .modal-overlay { background: rgba(0,0,0,0.7); }');
+  h.push('  /* ── 文件夹分类 ── */');
+  h.push('  .app-layout { display: flex; min-height: calc(100vh - 56px); }');
+  h.push('  .sidebar {');
+  h.push('    width: 220px;');
+  h.push('    background: #fff;');
+  h.push('    border-right: 1px solid #e0e0e0;');
+  h.push('    padding: 16px 0;');
+  h.push('    flex-shrink: 0;');
+  h.push('    overflow-y: auto;');
+  h.push('  }');
+  h.push('  .sidebar-title {');
+  h.push('    padding: 8px 16px;');
+  h.push('    font-size: 12px;');
+  h.push('    font-weight: 600;');
+  h.push('    color: #999;');
+  h.push('    text-transform: uppercase;');
+  h.push('    letter-spacing: 0.5px;');
+  h.push('    display: flex;');
+  h.push('    justify-content: space-between;');
+  h.push('    align-items: center;');
+  h.push('  }');
+  h.push('  .sidebar-title .add-folder {');
+  h.push('    background: none;');
+  h.push('    border: none;');
+  h.push('    color: #667eea;');
+  h.push('    font-size: 18px;');
+  h.push('    cursor: pointer;');
+  h.push('    padding: 0 4px;');
+  h.push('    line-height: 1;');
+  h.push('  }');
+  h.push('  .sidebar-title .add-folder:hover { color: #5a6fd6; }');
+  h.push('  .folder-item {');
+  h.push('    padding: 10px 16px;');
+  h.push('    cursor: pointer;');
+  h.push('    display: flex;');
+  h.push('    align-items: center;');
+  h.push('    gap: 8px;');
+  h.push('    font-size: 14px;');
+  h.push('    color: #555;');
+  h.push('    transition: background 0.15s;');
+  h.push('    position: relative;');
+  h.push('  }');
+  h.push('  .folder-item:hover { background: #f5f6fa; }');
+  h.push('  .folder-item.active { background: #eef0ff; color: #667eea; font-weight: 500; }');
+  h.push('  .folder-item .folder-icon { font-size: 16px; }');
+  h.push('  .folder-item .folder-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }');
+  h.push('  .folder-item .folder-count { font-size: 12px; color: #bbb; }');
+  h.push('  .folder-item .folder-actions {');
+  h.push('    display: none;');
+  h.push('    gap: 2px;');
+  h.push('    margin-left: auto;');
+  h.push('  }');
+  h.push('  .folder-item:hover .folder-actions { display: flex; }');
+  h.push('  .folder-actions button {');
+  h.push('    background: none;');
+  h.push('    border: none;');
+  h.push('    font-size: 13px;');
+  h.push('    cursor: pointer;');
+  h.push('    padding: 2px 4px;');
+  h.push('    border-radius: 3px;');
+  h.push('    color: #999;');
+  h.push('    line-height: 1;');
+  h.push('  }');
+  h.push('  .folder-actions button:hover { background: #e0e0e0; color: #333; }');
+  h.push('  .main-content { flex: 1; min-width: 0; }');
+  h.push('  .memo-card.dragging { opacity: 0.5; }');
+  h.push('  .sidebar.drag-over { background: #eef0ff; }');
+  h.push('  .folder-item.drag-over { background: #dde0ff; }');
+  h.push('  .folder-item.drag-over .folder-name { color: #667eea; }');
+  h.push('  [data-theme="dark"] .sidebar { background: #16213e; border-color: #2a2a4a; }');
+  h.push('  [data-theme="dark"] .sidebar-title { color: #707070; }');
+  h.push('  [data-theme="dark"] .sidebar-title .add-folder { color: #9090ff; }');
+  h.push('  [data-theme="dark"] .sidebar-title .add-folder:hover { color: #b0b0ff; }');
+  h.push('  [data-theme="dark"] .folder-item { color: #b0b0b0; }');
+  h.push('  [data-theme="dark"] .folder-item:hover { background: #1a1a3e; }');
+  h.push('  [data-theme="dark"] .folder-item.active { background: #2a2a5e; color: #9090ff; }');
+  h.push('  [data-theme="dark"] .folder-item .folder-count { color: #606060; }');
+  h.push('  [data-theme="dark"] .folder-actions button { color: #707070; }');
+  h.push('  [data-theme="dark"] .folder-actions button:hover { background: #3a3a5a; color: #e0e0e0; }');
+  h.push('  [data-theme="dark"] .sidebar.drag-over { background: #2a2a5e; }');
+  h.push('  [data-theme="dark"] .folder-item.drag-over { background: #3a3a6e; }');
+  h.push('  .folder-modal .modal { max-width: 400px; }');
   h.push('</style>');
   h.push('</head>');
   h.push('<body>');
@@ -694,7 +917,26 @@ function serveAppPage() {
   h.push('    <button class="btn-logout" id="logoutBtn">退出</button>');
   h.push('  </div>');
   h.push('</div>');
-  h.push('<div class="container" id="memoList"></div>');
+  h.push('<div class="app-layout">');
+  h.push('  <div class="sidebar" id="folderSidebar">');
+  h.push('    <div class="sidebar-title">');
+  h.push('      分类');
+  h.push('      <button class="add-folder" id="addFolderBtn" title="新建分类">+</button>');
+  h.push('    </div>');
+  h.push('    <div class="folder-item active" data-folder="all">');
+  h.push('      <span class="folder-icon">📋</span>');
+  h.push('      <span class="folder-name">所有备忘录</span>');
+  h.push('    </div>');
+  h.push('    <div class="folder-item" data-folder="none">');
+  h.push('      <span class="folder-icon">📄</span>');
+  h.push('      <span class="folder-name">未分类</span>');
+  h.push('    </div>');
+  h.push('    <div id="folderList"></div>');
+  h.push('  </div>');
+  h.push('  <div class="main-content">');
+  h.push('    <div class="container" id="memoList"></div>');
+  h.push('  </div>');
+  h.push('</div>');
   h.push('');
   h.push('<!-- 编辑/新建模态框 -->');
   h.push('<div class="modal-overlay" id="modalOverlay">');
@@ -710,10 +952,32 @@ function serveAppPage() {
   h.push('      <textarea id="memoContent" placeholder="输入内容..."></textarea>');
   h.push('      <div class="char-count" id="charCount">0 / 20000</div>');
   h.push('    </div>');
+  h.push('    <div class="field">');
+  h.push('      <label for="memoFolder">分类</label>');
+  h.push('      <select id="memoFolder">');
+  h.push('        <option value="">无分类</option>');
+  h.push('      </select>');
+  h.push('    </div>');
   h.push('    <div class="modal-btns">');
   h.push('      <button class="btn-delete-inline" id="deleteMemoBtn" style="display:none;">删除</button>');
   h.push('      <button class="btn-cancel" id="cancelBtn">取消</button>');
   h.push('      <button class="btn-save" id="saveBtn">保存</button>');
+  h.push('    </div>');
+  h.push('  </div>');
+  h.push('</div>');
+  h.push('');
+  h.push('<!-- 文件夹模态框 -->');
+  h.push('<div class="modal-overlay folder-modal" id="folderModal">');
+  h.push('  <div class="modal">');
+  h.push('    <h2 id="folderModalTitle">新建分类</h2>');
+  h.push('    <input type="hidden" id="editFolderId">');
+  h.push('    <div class="field">');
+  h.push('      <label for="folderName">分类名称</label>');
+  h.push('      <input id="folderName" type="text" placeholder="输入分类名称" maxlength="50">');
+  h.push('    </div>');
+  h.push('    <div class="modal-btns">');
+  h.push('      <button class="btn-cancel" id="folderCancelBtn">取消</button>');
+  h.push('      <button class="btn-save" id="folderSaveBtn">保存</button>');
   h.push('    </div>');
   h.push('  </div>');
   h.push('</div>');
@@ -723,6 +987,8 @@ function serveAppPage() {
   h.push('// ── 初始化 ───');
   h.push('var currentUser = "";');
   h.push('var memosCache = [];');
+  h.push('var foldersCache = [];');
+  h.push('var currentFolder = "all";');
   h.push('var isSaving = false;');
   h.push('');
   h.push('async function init() {');
@@ -732,7 +998,8 @@ function serveAppPage() {
   h.push('      var data = await res.json();');
   h.push('      currentUser = data.username;');
   h.push('      document.getElementById("usernameDisplay").textContent = currentUser;');
-  h.push('      loadMemos();');
+  h.push('      await loadFolders();');
+  h.push('      await loadMemos();');
   h.push('    } else {');
   h.push('      window.location.href = "/";');
   h.push('    }');
@@ -741,7 +1008,52 @@ function serveAppPage() {
   h.push('  }');
   h.push('}');
   h.push('');
-  h.push('// ── 加载备忘录列表 ───');
+  h.push('// ── 加载文件夹列表 ───');
+  h.push('async function loadFolders() {');
+  h.push('  try {');
+  h.push('    var res = await fetch("/api/folders");');
+  h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
+  h.push('    foldersCache = await res.json();');
+  h.push('    renderFolderList();');
+  h.push('  } catch(e) {}');
+  h.push('}');
+  h.push('');
+  h.push('function renderFolderList() {');
+  h.push('  var list = document.getElementById("folderList");');
+  h.push('  list.innerHTML = foldersCache.map(function(f) {');
+  h.push('    var count = memosCache.filter(function(m) { return m.folderId === f.id; }).length;');
+    h.push('    return "<div class=\\"folder-item\\" data-folder=\\"" + f.id + "\\" draggable=\\"false\\">" +');
+    h.push('      "<span class=\\"folder-icon\\">📁</span>" +');
+    h.push('      "<span class=\\"folder-name\\">" + escapeHtml(f.name) + "</span>" +');
+    h.push('      "<span class=\\"folder-count\\">" + count + "</span>" +');
+    h.push('      "<span class=\\"folder-actions\\">" +');
+    h.push('      "<button title=\\"重命名\\" data-rename=\\"" + f.id + "\\">✏️</button>" +');
+    h.push('      "<button title=\\"删除\\" data-del=\\"" + f.id + "\\">🗑️</button>" +');
+  h.push('      "</span>" +');
+  h.push('      "</div>";');
+  h.push('  }).join("");');
+  h.push('  // 高亮当前选中');
+  h.push('  list.querySelectorAll(".folder-item").forEach(function(el) {');
+  h.push('    if (el.dataset.folder === currentFolder) el.classList.add("active");');
+  h.push('  });');
+  h.push('  list.querySelectorAll("[data-rename]").forEach(function(btn) {');
+  h.push('    btn.addEventListener("click", function(e) { e.stopPropagation(); openRenameFolder(btn.dataset.rename); });');
+  h.push('  });');
+  h.push('  list.querySelectorAll("[data-del]").forEach(function(btn) {');
+  h.push('    btn.addEventListener("click", function(e) { e.stopPropagation(); deleteFolder(btn.dataset.del); });');
+  h.push('  });');
+  h.push('  // 文件夹点击过滤');
+  h.push('  list.querySelectorAll(".folder-item").forEach(function(el) {');
+  h.push('    el.addEventListener("click", function() { selectFolder(el.dataset.folder); });');
+  h.push('  });');
+  h.push('  // 文件夹作为拖拽目标');
+  h.push('  list.querySelectorAll(".folder-item").forEach(function(el) {');
+  h.push('    el.addEventListener("dragover", function(e) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; el.classList.add("drag-over"); });');
+  h.push('    el.addEventListener("dragleave", function() { el.classList.remove("drag-over"); });');
+  h.push('    el.addEventListener("drop", function(e) { e.preventDefault(); el.classList.remove("drag-over"); var memoId = e.dataTransfer.getData("text/memo-id"); if (memoId) moveMemoToFolder(memoId, el.dataset.folder); });');
+  h.push('  });');
+  h.push('  updateFolderSelect();');
+  h.push('}');
   h.push('async function loadMemos() {');
   h.push('  try {');
   h.push('    var res = await fetch("/api/memos");');
@@ -753,40 +1065,76 @@ function serveAppPage() {
   h.push('  }');
 h.push('}');
 h.push('');
-h.push('function renderMemoList() {');
-h.push('  var container = document.getElementById("memoList");');
-h.push('  if (memosCache.length === 0) {');
-h.push('    container.innerHTML = "<div class=\\"empty\\">还没有备忘录，点击右上角「新建」开始</div>";');
-h.push('    return;');
-h.push('  }');
-h.push('  container.innerHTML = memosCache.map(function(m) {');
-h.push('    var date = new Date(m.updatedAt).toLocaleString("zh-CN");');
-h.push('    var card = "<div class=\\"memo-card\\">";');
-h.push('    card += "<h3>" + escapeHtml(m.title || "(无标题)") + "</h3>";');
-h.push('    if (m.content) {');
-h.push('      card += "<p>" + escapeHtml(m.content) + "</p>";');
-h.push('    } else {');
-h.push('      card += "<p style=\\"color:#ccc;\\">无内容</p>";');
-h.push('    }');
-h.push('    card += "<div class=\\"time\\">更新于 " + date + "</div>";');
-h.push('    card += "<div class=\\"card-actions\\">";');
-h.push('    card += "<button title=\\"编辑\\" data-edit=\\"" + m.id + "\\">\u270F\uFE0F</button>";');
-h.push('    card += "<button title=\\"复制\\" data-copy=\\"" + m.id + "\\">\uD83D\uDCCB</button>";');
-h.push('    card += "<button title=\\"删除\\" data-delete=\\"" + m.id + "\\">\uD83D\uDDD1\uFE0F</button>";');
-h.push('    card += "</div>";');
-h.push('    card += "</div>";');
-h.push('    return card;');
-h.push('  }).join("");');
-h.push('  container.querySelectorAll("[data-edit]").forEach(function(btn) {');
-h.push('    btn.addEventListener("click", function() { openEditModal(btn.dataset.edit); });');
-h.push('  });');
-h.push('  container.querySelectorAll("[data-delete]").forEach(function(btn) {');
-h.push('    btn.addEventListener("click", function() { deleteMemoDirect(btn.dataset.delete); });');
-h.push('  });');
-h.push('  container.querySelectorAll("[data-copy]").forEach(function(btn) {');
-h.push('    btn.addEventListener("click", function() { copyMemoContent(btn.dataset.copy); });');
-h.push('  });');
-h.push('}');
+  h.push('function renderMemoList() {');
+  h.push('  var container = document.getElementById("memoList");');
+  h.push('  var filtered = memosCache;');
+  h.push('  if (currentFolder === "none") {');
+  h.push('    filtered = memosCache.filter(function(m) { return !m.folderId; });');
+  h.push('  } else if (currentFolder !== "all") {');
+  h.push('    filtered = memosCache.filter(function(m) { return m.folderId === currentFolder; });');
+  h.push('  }');
+  h.push('  if (filtered.length === 0) {');
+  h.push('    container.innerHTML = "<div class=\\"empty\\">还没有备忘录，点击右上角「新建」开始</div>";');
+  h.push('    return;');
+  h.push('  }');
+  h.push('  container.innerHTML = filtered.map(function(m) {');
+  h.push('    var date = new Date(m.updatedAt).toLocaleString("zh-CN");');
+  h.push('    var card = "<div class=\\"memo-card\\" draggable=\\"true\\" data-memo-id=\\"" + m.id + "\\">";');
+  h.push('    var folderName = "";');
+  h.push('    if (m.folderId) {');
+  h.push('      var f = foldersCache.find(function(f) { return f.id === m.folderId; });');
+  h.push('      if (f) folderName = "<span class=\\"memo-folder\\">📁 " + escapeHtml(f.name) + "</span>";');
+  h.push('    }');
+  h.push('    card += "<h3>" + escapeHtml(m.title || "(无标题)") + folderName + "</h3>";');
+  h.push('    if (m.content) {');
+  h.push('      card += "<p>" + escapeHtml(m.content) + "</p>";');
+  h.push('    } else {');
+  h.push('      card += "<p style=\\"color:#ccc;\\">无内容</p>";');
+  h.push('    }');
+  h.push('    card += "<div class=\\"time\\">更新于 " + date + "</div>";');
+  h.push('    card += "<div class=\\"card-actions\\">";');
+  h.push('    card += "<button title=\\"编辑\\" data-edit=\\"" + m.id + "\\">\u270F\uFE0F</button>";');
+  h.push('    card += "<button title=\\"复制\\" data-copy=\\"" + m.id + "\\">\uD83D\uDCCB</button>";');
+  h.push('    card += "<button title=\\"删除\\" data-delete=\\"" + m.id + "\\">\uD83D\uDDD1\uFE0F</button>";');
+  h.push('    card += "</div>";');
+  h.push('    card += "</div>";');
+  h.push('    return card;');
+  h.push('  }).join("");');
+  h.push('  container.querySelectorAll("[data-edit]").forEach(function(btn) {');
+  h.push('    btn.addEventListener("click", function() { openEditModal(btn.dataset.edit); });');
+  h.push('  });');
+  h.push('  container.querySelectorAll("[data-delete]").forEach(function(btn) {');
+  h.push('    btn.addEventListener("click", function() { deleteMemoDirect(btn.dataset.delete); });');
+  h.push('  });');
+  h.push('  container.querySelectorAll("[data-copy]").forEach(function(btn) {');
+  h.push('    btn.addEventListener("click", function() { copyMemoContent(btn.dataset.copy); });');
+  h.push('  });');
+  h.push('  // 拖拽支持');
+  h.push('  container.querySelectorAll(".memo-card[draggable]").forEach(function(card) {');
+  h.push('    card.addEventListener("dragstart", function(e) {');
+  h.push('      e.dataTransfer.setData("text/memo-id", card.dataset.memoId);');
+  h.push('      card.classList.add("dragging");');
+  h.push('    });');
+  h.push('    card.addEventListener("dragend", function() {');
+  h.push('      card.classList.remove("dragging");');
+  h.push('    });');
+  h.push('  });');
+  h.push('  // 未分类（sidebar空白）作为拖拽目标');
+  h.push('  var sidebar = document.getElementById("folderSidebar");');
+  h.push('  sidebar.addEventListener("dragover", function(e) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; sidebar.classList.add("drag-over"); });');
+  h.push('  sidebar.addEventListener("dragleave", function(e) {');
+  h.push('    if (!sidebar.contains(e.relatedTarget)) sidebar.classList.remove("drag-over");');
+  h.push('  });');
+  h.push('  sidebar.addEventListener("drop", function(e) {');
+  h.push('    e.preventDefault();');
+  h.push('    sidebar.classList.remove("drag-over");');
+  h.push('    var memoId = e.dataTransfer.getData("text/memo-id");');
+  h.push('    var target = e.target.closest("[data-folder]");');
+  h.push('    if (target) return; // 由 folder-item 处理');
+  h.push('    if (memoId) moveMemoToFolder(memoId, null);');
+  h.push('  });');
+  h.push('  updateFolderCounts();');
+  h.push('}');
 h.push('');
 h.push('function escapeHtml(text) {');
   h.push('  var div = document.createElement("div");');
@@ -800,6 +1148,7 @@ h.push('function escapeHtml(text) {');
   h.push('var editMemoId = document.getElementById("editMemoId");');
   h.push('var memoTitle = document.getElementById("memoTitle");');
   h.push('var memoContent = document.getElementById("memoContent");');
+  h.push('var memoFolder = document.getElementById("memoFolder");');
   h.push('var deleteBtn = document.getElementById("deleteMemoBtn");');
   h.push('var charCount = document.getElementById("charCount");');
   h.push('');
@@ -824,6 +1173,7 @@ h.push('function escapeHtml(text) {');
   h.push('  editMemoId.value = "";');
   h.push('  memoTitle.value = "";');
   h.push('  memoContent.value = "";');
+  h.push('  memoFolder.value = (currentFolder !== "all" && currentFolder !== "none") ? currentFolder : "";');
   h.push('  deleteBtn.style.display = "none";');
   h.push('  modalOverlay.classList.add("active");');
   h.push('  updateCharCount();');
@@ -848,6 +1198,7 @@ h.push('function escapeHtml(text) {');
   h.push('  if (memo) {');
   h.push('    memoTitle.value = memo.title;');
   h.push('    memoContent.value = memo.content;');
+  h.push('    memoFolder.value = memo.folderId || "";');
   h.push('  } else {');
   h.push('    alert("该备忘录不存在或已被删除");');
   h.push('    closeModal();');
@@ -884,13 +1235,13 @@ h.push('function escapeHtml(text) {');
   h.push('      res = await fetch("/api/memos/" + id, {');
   h.push('        method: "PUT",');
   h.push('        headers: { "Content-Type": "application/json" },');
-  h.push('        body: JSON.stringify({ title: title, content: content })');
+  h.push('        body: JSON.stringify({ title: title, content: content, folderId: memoFolder.value || null })');
   h.push('      });');
   h.push('    } else {');
   h.push('      res = await fetch("/api/memos", {');
   h.push('        method: "POST",');
   h.push('        headers: { "Content-Type": "application/json" },');
-  h.push('        body: JSON.stringify({ title: title, content: content })');
+  h.push('        body: JSON.stringify({ title: title, content: content, folderId: memoFolder.value || null })');
   h.push('      });');
   h.push('    }');
   h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
@@ -949,9 +1300,136 @@ h.push('    } else {');
   h.push('  });');
   h.push('}');
   h.push('');
+  h.push('// ── 文件夹操作 ───');
+  h.push('function selectFolder(id) {');
+  h.push('  currentFolder = id;');
+  h.push('  // 更新 sidebar 高亮');
+  h.push('  document.querySelectorAll("[data-folder]").forEach(function(el) {');
+  h.push('    el.classList.toggle("active", el.dataset.folder === id);');
+  h.push('  });');
+  h.push('  renderMemoList();');
+  h.push('}');
+  h.push('');
+  h.push('function updateFolderCounts() {');
+  h.push('  var list = document.getElementById("folderList");');
+  h.push('  if (!list) return;');
+  h.push('  list.querySelectorAll(".folder-item").forEach(function(el) {');
+  h.push('    var fid = el.dataset.folder;');
+  h.push('    var count = memosCache.filter(function(m) { return m.folderId === fid; }).length;');
+  h.push('    var countEl = el.querySelector(".folder-count");');
+  h.push('    if (countEl) countEl.textContent = count;');
+  h.push('  });');
+  h.push('}');
+  h.push('');
+  h.push('async function moveMemoToFolder(memoId, folderId) {');
+  h.push('  try {');
+  h.push('    var res = await fetch("/api/memos/" + memoId + "/folder", {');
+  h.push('      method: "PUT",');
+  h.push('      headers: { "Content-Type": "application/json" },');
+  h.push('      body: JSON.stringify({ folderId: folderId })');
+  h.push('    });');
+  h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
+  h.push('    if (res.ok) {');
+  h.push('      var memo = await res.json();');
+  h.push('      for (var i = 0; i < memosCache.length; i++) {');
+  h.push('        if (memosCache[i].id === memoId) { memosCache[i] = memo; break; }');
+  h.push('      }');
+  h.push('      renderMemoList();');
+  h.push('      renderFolderList();');
+  h.push('    } else { alert("移动失败"); }');
+  h.push('  } catch(e) { alert("网络错误"); }');
+  h.push('}');
+  h.push('');
+  h.push('function openNewFolder() {');
+  h.push('  document.getElementById("folderModalTitle").textContent = "新建分类";');
+  h.push('  document.getElementById("editFolderId").value = "";');
+  h.push('  document.getElementById("folderName").value = "";');
+  h.push('  document.getElementById("folderModal").classList.add("active");');
+  h.push('  document.getElementById("folderName").focus();');
+  h.push('}');
+  h.push('');
+  h.push('function openRenameFolder(id) {');
+  h.push('  var folder = foldersCache.find(function(f) { return f.id === id; });');
+  h.push('  if (!folder) return;');
+  h.push('  document.getElementById("folderModalTitle").textContent = "重命名分类";');
+  h.push('  document.getElementById("editFolderId").value = id;');
+  h.push('  document.getElementById("folderName").value = folder.name;');
+  h.push('  document.getElementById("folderModal").classList.add("active");');
+  h.push('  document.getElementById("folderName").focus();');
+  h.push('}');
+  h.push('');
+  h.push('async function saveFolder() {');
+  h.push('  var id = document.getElementById("editFolderId").value;');
+  h.push('  var name = document.getElementById("folderName").value.trim();');
+  h.push('  if (!name) { alert("请输入分类名称"); return; }');
+  h.push('  try {');
+  h.push('    var res;');
+  h.push('    if (id) {');
+  h.push('      res = await fetch("/api/folders/" + id, {');
+  h.push('        method: "PUT",');
+  h.push('        headers: { "Content-Type": "application/json" },');
+  h.push('        body: JSON.stringify({ name: name })');
+  h.push('      });');
+  h.push('    } else {');
+  h.push('      res = await fetch("/api/folders", {');
+  h.push('        method: "POST",');
+  h.push('        headers: { "Content-Type": "application/json" },');
+  h.push('        body: JSON.stringify({ name: name })');
+  h.push('      });');
+  h.push('    }');
+  h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
+  h.push('    if (res.ok) {');
+  h.push('      document.getElementById("folderModal").classList.remove("active");');
+  h.push('      loadFolders();');
+  h.push('    } else {');
+  h.push('      var err = await res.json();');
+  h.push('      alert(err.error || "操作失败");');
+  h.push('    }');
+  h.push('  } catch(e) { alert("网络错误"); }');
+  h.push('}');
+  h.push('');
+  h.push('async function deleteFolder(id) {');
+  h.push('  if (!confirm("确定要删除这个分类吗？\\n备忘录不会被删除，但会移出此分类。")) return;');
+  h.push('  try {');
+  h.push('    var res = await fetch("/api/folders/" + id, { method: "DELETE" });');
+  h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
+  h.push('    if (res.ok) {');
+  h.push('      if (currentFolder === id) selectFolder("all");');
+  h.push('      loadFolders();');
+  h.push('      loadMemos();');
+  h.push('    } else { alert("删除失败"); }');
+  h.push('  } catch(e) { alert("网络错误"); }');
+  h.push('}');
+  h.push('');
+  h.push('function updateFolderSelect() {');
+  h.push('  var select = memoFolder;');
+  h.push('  if (!select) return;');
+  h.push('  var value = select.value;');
+  h.push('  select.innerHTML = "<option value=\\"\\">无分类</option>";');
+  h.push('  foldersCache.forEach(function(f) {');
+  h.push('    var opt = document.createElement("option");');
+  h.push('    opt.value = f.id;');
+  h.push('    opt.textContent = f.name;');
+  h.push('    select.appendChild(opt);');
+  h.push('  });');
+  h.push('  select.value = value;');
+  h.push('}');
+  h.push('');
   h.push('// ── 事件绑定 ───');
   h.push('document.getElementById("newMemoBtn").addEventListener("click", openNewModal);');
   h.push('document.getElementById("cancelBtn").addEventListener("click", closeModal);');
+  h.push('document.getElementById("addFolderBtn").addEventListener("click", openNewFolder);');
+  h.push('document.getElementById("folderCancelBtn").addEventListener("click", function() {');
+  h.push('  document.getElementById("folderModal").classList.remove("active");');
+  h.push('});');
+  h.push('document.getElementById("folderSaveBtn").addEventListener("click", saveFolder);');
+  h.push('// 侧边栏「所有备忘录」和「未分类」点击');
+  h.push('document.querySelectorAll("[data-folder=\\"all\\"],[data-folder=\\"none\\"]").forEach(function(el) {');
+  h.push('  el.addEventListener("click", function() { selectFolder(el.dataset.folder); });');
+  h.push('});');
+  h.push('document.getElementById("folderName").addEventListener("keydown", function(e) {');
+  h.push('  if (e.key === "Enter") saveFolder();');
+  h.push('});');
   h.push('modalOverlay.addEventListener("click", function(e) {');
   h.push('  if (e.target === modalOverlay) closeModal();');
   h.push('});');
@@ -976,8 +1454,11 @@ h.push('    } else {');
   h.push('');
   h.push('// 键盘快捷键');
   h.push('document.addEventListener("keydown", function(e) {');
-  h.push('  if (e.key === "Escape" && modalOverlay.classList.contains("active")) {');
-  h.push('    closeModal();');
+  h.push('  if (e.key === "Escape") {');
+  h.push('    if (modalOverlay.classList.contains("active")) closeModal();');
+  h.push('    if (document.getElementById("folderModal").classList.contains("active")) {');
+  h.push('      document.getElementById("folderModal").classList.remove("active");');
+  h.push('    }');
   h.push('  }');
   h.push('  if ((e.ctrlKey || e.metaKey) && e.key === "s" && modalOverlay.classList.contains("active")) {');
   h.push('    e.preventDefault();');
