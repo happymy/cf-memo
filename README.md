@@ -7,6 +7,7 @@
 - **预设账号登录** — 通过环境变量 `USERNAME` / `PASSWORD` 登录，无需注册流程
 - **安全会话管理** — 基于 Web Crypto HMAC-SHA256 的 Session 令牌，24 小时有效期
 - **备忘录 CRUD** — 新建、编辑、删除、列表展示，数据持久化到 Cloudflare KV
+- **文件夹分类** — 创建/重命名/删除文件夹，按文件夹过滤备忘录，支持拖拽移动
 - **纯内嵌前端** — 单页应用，无需额外静态资源托管，登录/主界面合并在一个 Worker 中
 - **安全防护** — Cookie 标记 `HttpOnly; Secure; SameSite=Lax`，前端 XSS 转义
 
@@ -92,18 +93,23 @@ wrangler deploy
 | `POST` | `/api/logout` | ✅ | 登出，清除 Session Cookie |
 | `GET` | `/api/me` | ✅ | 获取当前登录用户信息 |
 | `GET` | `/api/memos` | ✅ | 获取所有备忘录列表 |
-| `POST` | `/api/memos` | ✅ | 新建备忘录，body: `{ title, content }` |
+| `POST` | `/api/memos` | ✅ | 新建备忘录，body: `{ title, content, folderId? }` |
 | `PUT` | `/api/memos/:id` | ✅ | 更新指定备忘录 |
 | `DELETE` | `/api/memos/:id` | ✅ | 删除指定备忘录 |
+| `GET` | `/api/folders` | ✅ | 获取所有文件夹列表 |
+| `POST` | `/api/folders` | ✅ | 新建文件夹，body: `{ name }` |
+| `PUT` | `/api/folders/:id` | ✅ | 重命名文件夹 |
+| `DELETE` | `/api/folders/:id` | ✅ | 删除文件夹（同时清除其下备忘录的 folderId） |
+| `PUT` | `/api/memos/:id/folder` | ✅ | 移动备忘录到指定文件夹，body: `{ folderId }` |
 
 > 未认证请求返回 `401 Unauthorized`；未登录用户访问页面会看到登录界面。
 
 ## 技术实现
 
 - **运行时**: Cloudflare Workers (ES Modules)
-- **存储**: Cloudflare KV (键名格式 `memo:<UUID>`)
+- **存储**: Cloudflare KV（`memo:<UUID>` 存储备忘录，`folder:<UUID>` 存储文件夹）
 - **认证**: 自定义 Session 令牌 = `用户名:时间戳:HMAC-SHA256签名`，无外部依赖
-- **前端**: 原生 HTML/CSS/JS，无框架，支持键盘快捷键（`Esc` 关闭模态框，`Ctrl+S` 保存）
+- **前端**: 原生 HTML/CSS/JS，无框架，侧边栏按文件夹筛选，支持拖拽分类及键盘快捷键（`Esc` 关闭模态框，`Ctrl+S` 保存）
 
 ## 许可证
 
