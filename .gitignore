@@ -1,0 +1,6 @@
+.wrangler/
+worker-configuration.d.ts
+.env
+.env.*
+node_modules/
+*.log

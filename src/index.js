@@ -201,6 +201,9 @@ export default {
 
 // ── 登录 / 登出 ─────────────────────────────────────────────────
 async function handleLogin(request, env) {
+  if (!request.headers.get('Content-Type')?.includes('application/json')) {
+    return json({ error: 'Content-Type must be application/json' }, 415);
+  }
   let body;
   try {
     body = await request.json();
@@ -400,9 +403,15 @@ async function handleUpdateMemo(request, memoId, env) {
     ...old,
     title: body.title !== undefined ? body.title.trim() : old.title,
     content: body.content !== undefined ? body.content.trim() : old.content,
-    folderId: body.folderId !== undefined ? body.folderId : old.folderId,
     updatedAt: Date.now(),
   };
+  if (body.folderId !== undefined) {
+    if (body.folderId === null) {
+      delete updated.folderId;
+    } else {
+      updated.folderId = body.folderId;
+    }
+  }
 
   await env.MEMOS_KV.put('memo:' + memoId, JSON.stringify(updated));
   return json(updated);
@@ -555,7 +564,7 @@ function securityHeaders() {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'same-origin',
-    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;",
+    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'none'",
     'Permissions-Policy': 'interest-cohort=()',
     'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
   };
@@ -1286,7 +1295,8 @@ h.push('            memosCache[i] = memo;');
 h.push('            break;');
 h.push('          }');
 h.push('        }');
-h.push('      } else {');
+h.push('        memosCache.sort(function(a,b){ return b.updatedAt - a.updatedAt; });');
+  h.push('      } else {');
 h.push('        memosCache.push(memo);');
 h.push('        memosCache.sort(function(a,b){ return b.updatedAt - a.updatedAt; });');
 h.push('      }');
@@ -1466,15 +1476,15 @@ h.push('    } else {');
   h.push('  if (e.target === modalOverlay) closeModal();');
   h.push('});');
   h.push('document.getElementById("saveBtn").addEventListener("click", saveMemo);');
-  h.push('document.getElementById("deleteMemoBtn").addEventListener("click", function() {');
+  h.push('document.getElementById("deleteMemoBtn").addEventListener("click", async function() {');
   h.push('  var id = editMemoId.value;');
-  h.push('  if (id && confirm("确定要删除这条备忘录吗？")) {');
-  h.push('    fetch("/api/memos/" + id, { method: "DELETE" }).then(function(r) {');
-  h.push('      if (r.status === 401) { window.location.href = "/"; return; }');
-  h.push('      if (r.ok) { memosCache = memosCache.filter(function(m) { return m.id !== id; }); closeModal(); renderMemoList(); }');
-  h.push('      else alert("删除失败");');
-  h.push('    });');
-  h.push('  }');
+  h.push('  if (!id || !confirm("确定要删除这条备忘录吗？")) return;');
+  h.push('  try {');
+  h.push('    var r = await fetch("/api/memos/" + id, { method: "DELETE" });');
+  h.push('    if (r.status === 401) { window.location.href = "/"; return; }');
+  h.push('    if (r.ok) { memosCache = memosCache.filter(function(m) { return m.id !== id; }); closeModal(); renderMemoList(); }');
+  h.push('    else alert("删除失败");');
+  h.push('  } catch(e) { alert("网络错误"); }');
   h.push('});');
   h.push('document.getElementById("logoutBtn").addEventListener("click", function() {');
   h.push('  fetch("/api/logout", { method: "POST" }).then(function() {');
