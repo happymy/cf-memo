@@ -234,7 +234,7 @@ async function handleLogin(request, env) {
   const storedPass = (env.PASSWORD || '').trim();
   const userMatch = constantTimeEqual(username, storedUser);
   const passMatch = constantTimeEqual(password, storedPass);
-  if (!userMatch | !passMatch) {
+  if (!userMatch || !passMatch) {
     try {
       await env.MEMOS_KV.put(rateLimitKey, String(attempts + 1), { expirationTtl: 900 });
     } catch { /* 忽略存储错误 */ }
@@ -265,7 +265,12 @@ async function handleLogin(request, env) {
 
 // 更新的 json 辅助函数，支持额外 header
 function json(data, status = 200, extraHeaders = {}) {
-  const headers = { 'Content-Type': 'application/json', ...extraHeaders };
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    ...extraHeaders,
+  };
   return new Response(JSON.stringify(data), { status, headers });
 }
 
@@ -477,7 +482,13 @@ async function handleUpdateFolder(request, folderId, env) {
   if (name.trim().length > 50) {
     return json({ error: 'Folder name must be 50 characters or less' }, 400);
   }
-  const folder = { ...JSON.parse(existing), name: name.trim() };
+  let folderData;
+  try {
+    folderData = JSON.parse(existing);
+  } catch {
+    return json({ error: 'Folder data corrupted' }, 500);
+  }
+  const folder = { ...folderData, name: name.trim() };
   await env.MEMOS_KV.put('folder:' + folderId, JSON.stringify(folder));
   return json(folder);
 }
