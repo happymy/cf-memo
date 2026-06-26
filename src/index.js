@@ -295,8 +295,8 @@ async function handleListMemos(user, env) {
   let cursor;
   do {
     const list = await env.MEMOS_KV.list({ prefix: 'memo:', cursor: cursor, limit: 1000 });
-    for (const key of list.keys) {
-      const raw = await env.MEMOS_KV.get(key.name);
+    const raws = await Promise.all(list.keys.map(k => env.MEMOS_KV.get(k.name)));
+    for (const raw of raws) {
       if (raw) {
         try {
           memos.push(JSON.parse(raw));
@@ -307,7 +307,7 @@ async function handleListMemos(user, env) {
   } while (cursor);
   // 按更新时间倒序
   memos.sort((a, b) => b.updatedAt - a.updatedAt);
-  return json(memos, 200, { 'Cache-Control': 'no-store' });
+  return json(memos, 200, { 'Cache-Control': 'public, max-age=2, s-maxage=5' });
 }
 
 async function handleCreateMemo(request, env) {
@@ -440,8 +440,8 @@ async function handleListFolders(env) {
   let cursor;
   do {
     const list = await env.MEMOS_KV.list({ prefix: 'folder:', cursor, limit: 1000 });
-    for (const key of list.keys) {
-      const raw = await env.MEMOS_KV.get(key.name);
+    const raws = await Promise.all(list.keys.map(k => env.MEMOS_KV.get(k.name)));
+    for (const raw of raws) {
       if (raw) {
         try { folders.push(JSON.parse(raw)); } catch { /* 忽略损坏数据 */ }
       }
@@ -449,7 +449,7 @@ async function handleListFolders(env) {
     cursor = list.list_complete ? undefined : list.cursor;
   } while (cursor);
   folders.sort((a, b) => a.createdAt - b.createdAt);
-  return json(folders, 200, { 'Cache-Control': 'no-store' });
+  return json(folders, 200, { 'Cache-Control': 'public, max-age=2, s-maxage=5' });
 }
 
 async function handleCreateFolder(request, env) {
@@ -504,19 +504,22 @@ async function handleDeleteFolder(folderId, env) {
   let cursor;
   do {
     const list = await env.MEMOS_KV.list({ prefix: 'memo:', cursor, limit: 1000 });
-    for (const key of list.keys) {
-      const raw = await env.MEMOS_KV.get(key.name);
+    const raws = await Promise.all(list.keys.map(k => env.MEMOS_KV.get(k.name)));
+    const updates = [];
+    for (let i = 0; i < list.keys.length; i++) {
+      const raw = raws[i];
       if (raw) {
         try {
           const memo = JSON.parse(raw);
           if (memo.folderId === folderId) {
             delete memo.folderId;
             memo.updatedAt = Date.now();
-            await env.MEMOS_KV.put(key.name, JSON.stringify(memo));
+            updates.push(env.MEMOS_KV.put(list.keys[i].name, JSON.stringify(memo)));
           }
         } catch { /* 忽略损坏数据 */ }
       }
     }
+    await Promise.all(updates);
     cursor = list.list_complete ? undefined : list.cursor;
   } while (cursor);
   return json({ ok: true });
@@ -1028,8 +1031,7 @@ function serveAppPage() {
   h.push('      var data = await res.json();');
   h.push('      currentUser = data.username;');
   h.push('      document.getElementById("usernameDisplay").textContent = currentUser;');
-  h.push('      await loadFolders();');
-  h.push('      await loadMemos();');
+  h.push('      await Promise.all([loadFolders(), loadMemos()]);');
   h.push('    } else {');
   h.push('      window.location.href = "/";');
   h.push('    }');
