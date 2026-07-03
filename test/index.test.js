@@ -214,3 +214,31 @@ describe("Folders", () => {
     expect(list[0].name).toBe("个人");
   });
 });
+
+// ── 星标 ───
+describe("Star", () => {
+  it("星标切换后 starred 字段翻转", async () => {
+    const created = await (await authedFetch("/api/memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "星标测试" }),
+    })).json();
+    const res = await authedFetch(`/api/memos/${created.id}/star`, { method: "PUT" });
+    expect(res.status).toBe(200);
+    const starred = await res.json();
+    expect(starred.starred).toBe(true);
+    const res2 = await authedFetch(`/api/memos/${created.id}/star`, { method: "PUT" });
+    const unstarred = await res2.json();
+    expect(unstarred.starred).toBe(false);
+  });
+
+  it("星标备忘录在列表中 starred 为 true", async () => {
+    const created = await (await authedFetch("/api/memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "重要" }),
+    })).json();
+    await authedFetch(`/api/memos/${created.id}/star`, { method: "PUT" });
+    const list = await (await authedFetch("/api/memos")).json();
+    const m = list.find(x => x.id === created.id);
+    expect(m.starred).toBe(true);
+  });
+});

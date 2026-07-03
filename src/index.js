@@ -109,6 +109,15 @@ function isSecureRequest(request) {
 // ── 路由分发 ─────────────────────────────────────────────────────
 export default {
   async fetch(request, env) {
+    try {
+      return await handleRequest(request, env);
+    } catch (err) {
+      return new Response('Internal error: ' + (err.message || err), { status: 500, headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
+    }
+  }
+};
+
+async function handleRequest(request, env) {
     const url = new URL(request.url);
     const method = request.method;
     const path = url.pathname;
@@ -163,6 +172,12 @@ export default {
         if (method === 'PUT') return handleMoveMemo(request, memoId, env);
       }
 
+      if (path.startsWith('/api/memos/') && path.endsWith('/star')) {
+        const memoId = path.slice('/api/memos/'.length, -'/star'.length);
+        if (!memoId) return json({ error: 'Missing memo id' }, 400);
+        if (method === 'PUT') return handleStarMemo(memoId, env);
+      }
+
       if (path.startsWith('/api/memos/') && path.endsWith('/share')) {
         const memoId = path.slice('/api/memos/'.length, -'/share'.length);
         if (!memoId) return json({ error: 'Missing memo id' }, 400);
@@ -209,8 +224,7 @@ export default {
     }
 
     return json({ error: 'Method Not Allowed' }, 405);
-  },
-};
+}
 
 // ── 登录 / 登出 ─────────────────────────────────────────────────
 async function handleLogin(request, env) {
@@ -334,11 +348,14 @@ async function handleCreateMemo(request, env) {
     return json({ error: 'Invalid JSON' }, 400);
   }
   
-  const { title, content, folderId } = body;
-  if (folderId !== undefined && folderId !== null) {
-    if (typeof folderId !== 'string' || !/^[a-zA-Z0-9_-]{1,40}$/.test(folderId)) return json({ error: 'Invalid folder id' }, 400);
-    const folderExists = await env.MEMOS_KV.get('folder:' + folderId);
-    if (!folderExists) return json({ error: 'Folder not found' }, 400);
+  const { title, content, folderIds } = body;
+  if (folderIds !== undefined) {
+    if (!Array.isArray(folderIds)) return json({ error: 'folderIds must be an array' }, 400);
+    for (const fid of folderIds) {
+      if (typeof fid !== 'string' || !/^[a-zA-Z0-9_-]{1,40}$/.test(fid)) return json({ error: 'Invalid folder id' }, 400);
+      const folderExists = await env.MEMOS_KV.get('folder:' + fid);
+      if (!folderExists) return json({ error: 'Folder not found' }, 400);
+    }
   }
   if (title !== undefined && typeof title !== 'string') {
     return json({ error: 'Title must be a string' }, 400);
@@ -364,7 +381,7 @@ async function handleCreateMemo(request, env) {
     createdAt: now,
     updatedAt: now,
   };
-  if (folderId) memo.folderId = folderId;
+  if (folderIds && folderIds.length) memo.folderIds = folderIds;
 
   await env.MEMOS_KV.put('memo:' + memo.id, JSON.stringify(memo));
   return json(memo, 201);
@@ -400,10 +417,13 @@ async function handleUpdateMemo(request, memoId, env) {
   if (body.content !== undefined && body.content.length > 20000) {
     return json({ error: 'Content must be 20000 characters or less' }, 400);
   }
-  if (body.folderId !== undefined && body.folderId !== null) {
-    if (typeof body.folderId !== 'string' || !/^[a-zA-Z0-9_-]{1,40}$/.test(body.folderId)) return json({ error: 'Invalid folder id' }, 400);
-    const folderExists = await env.MEMOS_KV.get('folder:' + body.folderId);
-    if (!folderExists) return json({ error: 'Folder not found' }, 400);
+  if (body.folderIds !== undefined) {
+    if (!Array.isArray(body.folderIds)) return json({ error: 'folderIds must be an array' }, 400);
+    for (const fid of body.folderIds) {
+      if (typeof fid !== 'string' || !/^[a-zA-Z0-9_-]{1,40}$/.test(fid)) return json({ error: 'Invalid folder id' }, 400);
+      const folderExists = await env.MEMOS_KV.get('folder:' + fid);
+      if (!folderExists) return json({ error: 'Folder not found' }, 400);
+    }
   }
 
   let old;
@@ -418,11 +438,11 @@ async function handleUpdateMemo(request, memoId, env) {
     content: body.content !== undefined ? body.content.trim() : old.content,
     updatedAt: Date.now(),
   };
-  if (body.folderId !== undefined) {
-    if (body.folderId === null) {
-      delete updated.folderId;
+  if (body.folderIds !== undefined) {
+    if (!body.folderIds.length) {
+      delete updated.folderIds;
     } else {
-      updated.folderId = body.folderId;
+      updated.folderIds = body.folderIds;
     }
   }
 
@@ -493,10 +513,25 @@ async function handleUnshareMemo(memoId, env) {
   if (memo.shareToken) {
     await Promise.all([
       env.MEMOS_KV.delete('share:' + memo.shareToken),
-      env.MEMOS_KV.put('memo:' + memoId, JSON.stringify(Object.assign({}, memo, { shareToken: undefined }))),
+      delete memo.shareToken,
+      env.MEMOS_KV.put('memo:' + memoId, JSON.stringify(memo)),
     ]);
   }
   return json({ ok: true });
+}
+
+async function handleStarMemo(memoId, env) {
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(memoId)) {
+    return json({ error: 'Invalid memo id' }, 400);
+  }
+  const existing = await env.MEMOS_KV.get('memo:' + memoId);
+  if (!existing) return json({ error: 'Memo not found' }, 404);
+  let memo;
+  try { memo = JSON.parse(existing); } catch { return json({ error: 'Memo data corrupted' }, 500); }
+  memo.starred = !memo.starred;
+  memo.updatedAt = Date.now();
+  await env.MEMOS_KV.put('memo:' + memoId, JSON.stringify(memo));
+  return json(memo);
 }
 
 function serveSharePage(token, env) {
@@ -528,6 +563,8 @@ function serveSharePage(token, env) {
         },
       });
     });
+  }).catch(function() {
+    return new Response('加载失败', { status: 500, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
   });
 }
 
@@ -608,8 +645,11 @@ async function handleDeleteFolder(folderId, env) {
       if (raw) {
         try {
           const memo = JSON.parse(raw);
-          if (memo.folderId === folderId) {
-            delete memo.folderId;
+          var fids = memo.folderIds || [];
+          var idx = fids.indexOf(folderId);
+          if (idx !== -1) {
+            fids.splice(idx, 1);
+            if (fids.length) { memo.folderIds = fids; } else { delete memo.folderIds; }
             memo.updatedAt = Date.now();
             updates.push(env.MEMOS_KV.put(list.keys[i].name, JSON.stringify(memo)));
           }
@@ -629,17 +669,17 @@ async function handleMoveMemo(request, memoId, env) {
   let body;
   try { body = await request.json(); } catch { return json({ error: 'Invalid JSON' }, 400); }
   const { folderId } = body;
-  if (folderId !== null && folderId !== undefined) {
+  let memo;
+  try { memo = JSON.parse(existing); } catch { return json({ error: 'Memo data corrupted' }, 500); }
+  var fids = memo.folderIds || [];
+  if (folderId === null || folderId === undefined) {
+    delete memo.folderIds;
+  } else {
     if (typeof folderId !== 'string' || !/^[a-zA-Z0-9_-]{1,40}$/.test(folderId)) return json({ error: 'Invalid folder id' }, 400);
     const folderExists = await env.MEMOS_KV.get('folder:' + folderId);
     if (!folderExists) return json({ error: 'Folder not found' }, 404);
-  }
-  let memo;
-  try { memo = JSON.parse(existing); } catch { return json({ error: 'Memo data corrupted' }, 500); }
-  if (folderId === null || folderId === undefined) {
-    delete memo.folderId;
-  } else {
-    memo.folderId = folderId;
+    var idx = fids.indexOf(folderId);
+    if (idx === -1) { fids.push(folderId); memo.folderIds = fids; }
   }
   memo.updatedAt = Date.now();
   await env.MEMOS_KV.put('memo:' + memoId, JSON.stringify(memo));
@@ -788,7 +828,7 @@ function serveAppPage() {
   h.push('    --bg: #f0f2f5; --surface: #fff; --surface-hover: #f8f9fa;');
   h.push('    --primary: #4f6ef7; --primary-hover: #3b5de7; --primary-light: #eef0ff;');
   h.push('    --text: #1a1a2e; --text-secondary: #6b7280; --text-muted: #9ca3af;');
-  h.push('    --border: #e5e7eb; --radius: 12px; --radius-sm: 8px; --header-h: 56px;');
+  h.push('    --border: #e5e7eb; --star-bg: #fffbeb; --radius: 12px; --radius-sm: 8px; --header-h: 56px;');
   h.push('    --shadow: 0 1px 3px rgba(0,0,0,0.06);');
   h.push('    --shadow-hover: 0 4px 12px rgba(0,0,0,0.08);');
   h.push('  }');
@@ -796,7 +836,7 @@ function serveAppPage() {
   h.push('    --bg: #0f0f1a; --surface: #1a1a2e; --surface-hover: #222238;');
   h.push('    --primary-light: #2a2a5e; --text: #e8e8f0;');
   h.push('    --text-secondary: #a0a0b8; --text-muted: #6b6b80;');
-  h.push('    --border: #2a2a4a;');
+  h.push('    --border: #2a2a4a; --star-bg: #1e1a0a;');
   h.push('    --shadow: 0 1px 3px rgba(0,0,0,0.3);');
   h.push('    --shadow-hover: 0 4px 12px rgba(0,0,0,0.5);');
   h.push('  }');
@@ -860,7 +900,10 @@ function serveAppPage() {
   h.push('  .container { max-width:800px; margin:0 auto; padding:20px 24px; }');
   h.push('  .memo-card { background:var(--surface); border-radius:var(--radius); padding:20px; margin-bottom:12px; box-shadow:var(--shadow); transition:box-shadow .2s, transform .15s, border-color .2s; position:relative; border:1px solid var(--border); }');
   h.push('  .memo-card:hover { box-shadow:var(--shadow-hover); transform:translateY(-1px); border-color:var(--primary); }');
-  h.push('  .memo-card.shared-card { border-left:3px solid #22c55e; }');
+    h.push('  .memo-card.shared-card { border-left:3px solid #22c55e; }');
+  h.push('  .memo-card.starred-card { background:var(--star-bg); }');
+  h.push('  .star-btn { font-size:16px; line-height:1; }');
+  h.push('  .star-btn.starred { color:#f59e0b; }');
   h.push('  .memo-card h3 { margin-bottom:8px; font-size:16px; color:var(--text); display:flex; align-items:center; gap:8px; }');
   h.push('  .memo-card h3 .memo-folder { font-size:11px; color:var(--primary); background:var(--primary-light); padding:1px 8px; border-radius:10px; font-weight:400; }');
   h.push('  .memo-card p { color:var(--text-secondary); font-size:14px; line-height:1.7; white-space:pre-wrap; }');
@@ -869,10 +912,10 @@ function serveAppPage() {
   h.push('  .memo-card:hover .card-actions { opacity:1; }');
   h.push('  .card-actions button { background:var(--surface-hover); border:none; font-size:14px; cursor:pointer; padding:4px 6px; border-radius:4px; color:var(--text-muted); line-height:1; transition:all .1s; }');
   h.push('  .card-actions button:hover { background:var(--border); color:var(--text); }');
-  h.push('  .drag-handle { cursor:grab; color:var(--text-tertiary); font-size:16px; line-height:1; padding:2px 4px; border-radius:4px; user-select:none; -webkit-user-drag:element; position:absolute; top:10px; right:10px; opacity:0; transition:opacity .15s; }');
+  h.push('  .drag-handle { cursor:grab; color:var(--text-tertiary); font-size:16px; line-height:1; padding:2px 4px; border-radius:4px; user-select:none; -webkit-user-drag:element; position:absolute; bottom:10px; right:10px; opacity:0; transition:opacity .15s; }');
   h.push('  .memo-card:hover .drag-handle, .drag-handle:active { opacity:1; }');
   h.push('  .drag-handle:active { cursor:grabbing; color:var(--primary); background:var(--surface-hover); }');
-  h.push('  .memo-card.dragging { opacity:0.5; }');
+  h.push('  .memo-card.dragging { opacity:0.4; box-shadow:0 8px 25px rgba(0,0,0,.15); }');
   h.push('  .empty { text-align:center; color:var(--text-muted); padding:80px 20px; font-size:14px; line-height:1.8; }');
   h.push('  .empty .empty-icon { font-size:48px; margin-bottom:16px; display:block; }');
   h.push('  .modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.45); z-index:100; align-items:center; justify-content:center; backdrop-filter:blur(2px); }');
@@ -885,8 +928,10 @@ function serveAppPage() {
   h.push('  .modal .field input, .modal .field textarea { width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:var(--radius-sm); font-size:14px; font-family:inherit; background:var(--surface); color:var(--text); transition:border-color .15s; }');
   h.push('  .modal .field textarea { resize:vertical; min-height:160px; max-height:500px; }');
   h.push('  .modal .field input:focus, .modal .field textarea:focus { outline:none; border-color:var(--primary); box-shadow:0 0 0 3px rgba(79,110,247,0.12); }');
-  h.push('  .modal .field select { width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:var(--radius-sm); font-size:14px; background:var(--surface); color:var(--text); cursor:pointer; }');
-  h.push('  .modal .field select:focus { outline:none; border-color:var(--primary); }');
+  h.push('  .folder-checkboxes { display:flex; flex-wrap:wrap; gap:6px; padding:4px 0; }');
+  h.push('  .folder-checkboxes label { display:flex; align-items:center; gap:4px; padding:4px 10px; border:1px solid var(--border); border-radius:var(--radius-sm); font-size:13px; cursor:pointer; user-select:none; transition:all .12s; }');
+  h.push('  .folder-checkboxes label:hover { border-color:var(--primary); }');
+  h.push('  .folder-checkboxes label:has(input:checked) { border-color:var(--primary); background:var(--primary-light); font-weight:500; color:var(--primary); }');
   h.push('  .char-count { text-align:right; font-size:11px; color:var(--text-muted); margin-top:4px; }');
   h.push('  .char-count.warning { color:#ef4444; }');
   h.push('  .modal-btns { display:flex; gap:10px; justify-content:flex-end; margin-top:12px; align-items:center; }');
@@ -986,6 +1031,10 @@ function serveAppPage() {
   h.push('      <span class="folder-icon">📋</span>');
   h.push('      <span class="folder-name">所有备忘录</span>');
   h.push('    </div>');
+    h.push('    <div class="folder-item" data-folder="starred">');
+    h.push('      <span class="folder-icon">⭐</span>');
+    h.push('      <span class="folder-name">星标</span>');
+    h.push('    </div>');
     h.push('    <div class="folder-item" data-folder="none">');
     h.push('      <span class="folder-icon">📄</span>');
     h.push('      <span class="folder-name">未分类</span>');
@@ -1024,11 +1073,9 @@ function serveAppPage() {
   h.push('      <div class="char-count" id="charCount">0 / 20000</div>');
   h.push('    </div>');
   h.push('    <div class="field">');
-  h.push('      <label for="memoFolder">分类</label>');
-  h.push('      <select id="memoFolder">');
-  h.push('        <option value="">无分类</option>');
-  h.push('      </select>');
-    h.push('    </div>');
+  h.push('      <label>分类</label>');
+  h.push('      <div id="memoFolders" class="folder-checkboxes"></div>');
+  h.push('    </div>');
     h.push('    <div class="field share-field" style="display:none">');
     h.push('      <label class="share-row">');
     h.push('        <span>公开分享</span>');
@@ -1104,7 +1151,7 @@ function serveAppPage() {
   h.push('function renderFolderList() {');
   h.push('  var list = document.getElementById("folderList");');
   h.push('  list.innerHTML = foldersCache.map(function(f) {');
-  h.push('    var count = memosCache.filter(function(m) { return m.folderId === f.id; }).length;');
+  h.push('    var count = memosCache.filter(function(m) { return (m.folderIds || []).indexOf(f.id) !== -1; }).length;');
     h.push('    return "<div class=\\"folder-item\\" data-folder=\\"" + f.id + "\\" draggable=\\"false\\">" +');
     h.push('      "<span class=\\"folder-icon\\">📁</span>" +');
     h.push('      "<span class=\\"folder-name\\">" + escapeHtml(f.name) + "</span>" +');
@@ -1135,7 +1182,7 @@ function serveAppPage() {
   h.push('    el.addEventListener("dragleave", function() { el.classList.remove("drag-over"); });');
   h.push('    el.addEventListener("drop", function(e) { e.preventDefault(); el.classList.remove("drag-over"); var memoId = e.dataTransfer.getData("text/memo-id"); if (memoId) moveMemoToFolder(memoId, el.dataset.folder); });');
   h.push('  });');
-  h.push('  updateFolderSelect();');
+  h.push('  updateFolderCheckboxes();');
   h.push('}');
   h.push('async function loadMemos() {');
   h.push('  try {');
@@ -1152,33 +1199,40 @@ h.push('');
   h.push('  var container = document.getElementById("memoList");');
   h.push('  var q = searchQuery.trim().toLowerCase();');
   h.push('  var filtered = memosCache;');
-  h.push('  if (currentFolder === "none") {');
-  h.push('    filtered = memosCache.filter(function(m) { return !m.folderId; });');
+  h.push('  if (currentFolder === "starred") {');
+  h.push('    filtered = memosCache.filter(function(m) { return m.starred; });');
+  h.push('  } else if (currentFolder === "none") {');
+  h.push('    filtered = memosCache.filter(function(m) { return !m.folderIds || !m.folderIds.length; });');
   h.push('  } else if (currentFolder === "shared") {');
   h.push('    filtered = memosCache.filter(function(m) { return m.shareToken; });');
   h.push('  } else if (currentFolder !== "all") {');
-  h.push('    filtered = memosCache.filter(function(m) { return m.folderId === currentFolder; });');
+  h.push('    filtered = memosCache.filter(function(m) { return (m.folderIds || []).indexOf(currentFolder) !== -1; });');
   h.push('  }');
   h.push('  if (q) {');
   h.push('    filtered = filtered.filter(function(m) { return (m.title||"").toLowerCase().indexOf(q) !== -1 || (m.content||"").toLowerCase().indexOf(q) !== -1; });');
   h.push('  }');
   h.push('  if (filtered.length === 0) {');
-  h.push('    container.innerHTML = "<div class=\\"empty\\">还没有备忘录，点击右上角「新建」开始</div>";');
+  h.push('    var emptyMsg = currentFolder === "starred" ? "还没有星标备忘录，点击卡片上的 ⭐ 星标" : "还没有备忘录，点击右上角「新建」开始";');
+  h.push('    container.innerHTML = "<div class=\\"empty\\">" + emptyMsg + "</div>";');
   h.push('    return;');
   h.push('  }');
   h.push('  container.innerHTML = filtered.map(function(m) {');
   h.push('    var date = new Date(m.updatedAt).toLocaleString("zh-CN");');
   h.push('    var shareCls = m.shareToken ? " shared" : "";');
-    h.push('    var cardCls = "memo-card" + (m.shareToken ? " shared-card" : "");');
+  h.push('    var starCls = m.starred ? " starred" : "";');
+    h.push('    var cardCls = "memo-card" + (m.shareToken ? " shared-card" : "") + (m.starred ? " starred-card" : "");');
   h.push('    var card = "<div class=\\"" + cardCls + "\\" data-memo-id=\\"" + m.id + "\\">";');
   h.push('    card += "<label class=\\"batch-checkbox\\"><input type=\\"checkbox\\" data-batch=\\"" + m.id + "\\"></label>";');
   h.push('    card += "<span class=\\"drag-handle\\" draggable=\\"true\\" title=\\"拖拽移动\\">⠿</span>";');
-  h.push('    var folderName = "";');
-  h.push('    if (m.folderId) {');
-  h.push('      var f = foldersCache.find(function(f) { return f.id === m.folderId; });');
-  h.push('      if (f) folderName = "<span class=\\"memo-folder\\">📁 " + escapeHtml(f.name) + "</span>";');
+    h.push('    var folderNames = "";');
+  h.push('    var fids = m.folderIds || [];');
+  h.push('    if (fids.length) {');
+  h.push('      folderNames = fids.map(function(fid) {');
+  h.push('        var f = foldersCache.find(function(f) { return f.id === fid; });');
+  h.push('        return f ? "<span class=\\"memo-folder\\">📁 " + escapeHtml(f.name) + "</span>" : "";');
+  h.push('      }).join(" ");');
   h.push('    }');
-  h.push('    card += "<h3>" + escapeHtml(m.title || "(无标题)") + folderName + "</h3>";');
+  h.push('    card += "<h3>" + escapeHtml(m.title || "(无标题)") + folderNames + "</h3>";');
   h.push('    if (m.content) {');
   h.push('      card += "<p>" + escapeHtml(m.content) + "</p>";');
   h.push('    } else {');
@@ -1186,7 +1240,8 @@ h.push('');
   h.push('    }');
   h.push('    card += "<div class=\\"time\\">更新于 " + date + "</div>";');
   h.push('    card += "<div class=\\"card-actions\\">";');
-    h.push('    card += "<button title=\\"编辑\\" data-edit=\\"" + m.id + "\\">\u270F\uFE0F</button>";');
+    h.push('    card += "<button class=\\"star-btn" + starCls + "\\" title=\\"星标\\" data-star=\\"" + m.id + "\\">" + (m.starred ? "\u2B50" : "\u2606") + "</button>";');
+  h.push('    card += "<button title=\\"编辑\\" data-edit=\\"" + m.id + "\\">\u270F\uFE0F</button>";');
     h.push('    card += "<button class=\\"share-btn" + shareCls + "\\" title=\\"分享\\" data-share=\\"" + m.id + "\\">\uD83D\uDD17</button>";');
     h.push('    card += "<button title=\\"复制\\" data-copy=\\"" + m.id + "\\">\uD83D\uDCCB</button>";');
     h.push('    card += "<button title=\\"删除\\" data-delete=\\"" + m.id + "\\">\uD83D\uDDD1\uFE0F</button>";');
@@ -1200,6 +1255,9 @@ h.push('');
   h.push('  container.querySelectorAll("[data-delete]").forEach(function(btn) {');
   h.push('    btn.addEventListener("click", function() { deleteMemoDirect(btn.dataset.delete); });');
   h.push('  });');
+  h.push('  container.querySelectorAll("[data-star]").forEach(function(btn) {');
+  h.push('    btn.addEventListener("click", function() { toggleStar(btn.dataset.star); });');
+  h.push('  });');
   h.push('  container.querySelectorAll("[data-share]").forEach(function(btn) {');
   h.push('    btn.addEventListener("click", function() { shareMemo(btn.dataset.share); });');
   h.push('  });');
@@ -1212,6 +1270,7 @@ h.push('');
   h.push('      var card = handle.closest(".memo-card");');
   h.push('      e.dataTransfer.setData("text/memo-id", card.dataset.memoId);');
   h.push('      card.classList.add("dragging");');
+  h.push('      e.dataTransfer.setDragImage(card, e.clientX - card.getBoundingClientRect().left, e.clientY - card.getBoundingClientRect().top);');
   h.push('    });');
   h.push('    handle.addEventListener("dragend", function() {');
   h.push('      var card = handle.closest(".memo-card");');
@@ -1259,7 +1318,7 @@ h.push('function escapeHtml(text) {');
   h.push('var editMemoId = document.getElementById("editMemoId");');
   h.push('var memoTitle = document.getElementById("memoTitle");');
   h.push('var memoContent = document.getElementById("memoContent");');
-  h.push('var memoFolder = document.getElementById("memoFolder");');
+
   h.push('var deleteBtn = document.getElementById("deleteMemoBtn");');
   h.push('var charCount = document.getElementById("charCount");');
   h.push('');
@@ -1284,7 +1343,11 @@ h.push('function escapeHtml(text) {');
   h.push('  editMemoId.value = "";');
   h.push('  memoTitle.value = "";');
   h.push('  memoContent.value = "";');
-  h.push('  memoFolder.value = (currentFolder !== "all" && currentFolder !== "none") ? currentFolder : "";');
+  h.push('  updateFolderCheckboxes();');
+  h.push('  if (currentFolder !== "all" && currentFolder !== "none" && currentFolder !== "starred" && currentFolder !== "shared") {');
+  h.push('    var cb = document.querySelector("#memoFolders input[value=\\"" + currentFolder + "\\"]");');
+  h.push('    if (cb) cb.checked = true;');
+  h.push('  }');
   h.push('  deleteBtn.style.display = "none";');
   h.push('  var shareField = document.querySelector(".share-field");');
   h.push('  if (shareField) shareField.style.display = "none";');
@@ -1311,7 +1374,12 @@ h.push('function escapeHtml(text) {');
   h.push('  if (memo) {');
   h.push('    memoTitle.value = memo.title;');
   h.push('    memoContent.value = memo.content;');
-  h.push('    memoFolder.value = memo.folderId || "";');
+  h.push('    updateFolderCheckboxes();');
+  h.push('    var fids = memo.folderIds || [];');
+  h.push('    fids.forEach(function(fid) {');
+  h.push('      var cb = document.querySelector("#memoFolders input[value=\\"' + fid + '\\"]");');
+  h.push('      if (cb) cb.checked = true;');
+  h.push('    });');
   h.push('    var shareField = document.querySelector(".share-field");');
   h.push('    if (shareField) {');
   h.push('      shareField.style.display = "block";');
@@ -1363,13 +1431,13 @@ h.push('function escapeHtml(text) {');
   h.push('      res = await fetch("/api/memos/" + id, {');
   h.push('        method: "PUT",');
   h.push('        headers: { "Content-Type": "application/json" },');
-  h.push('        body: JSON.stringify({ title: title, content: content, folderId: memoFolder.value || null })');
+  h.push('        body: JSON.stringify({ title: title, content: content, folderIds: getSelectedFolders() })');
   h.push('      });');
   h.push('    } else {');
   h.push('      res = await fetch("/api/memos", {');
   h.push('        method: "POST",');
   h.push('        headers: { "Content-Type": "application/json" },');
-  h.push('        body: JSON.stringify({ title: title, content: content, folderId: memoFolder.value || null })');
+  h.push('        body: JSON.stringify({ title: title, content: content, folderIds: getSelectedFolders() })');
   h.push('      });');
   h.push('    }');
   h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
@@ -1458,9 +1526,23 @@ h.push('    } else {');
   h.push('    } else { toast("创建分享失败"); }');
   h.push('  } catch(e) { toast("网络错误"); }');
   h.push('}');
-  h.push('');
-  h.push('// ── 文件夹操作 ───');
-  h.push('function selectFolder(id) {');
+h.push('');
+h.push('async function toggleStar(id) {');
+h.push('  try {');
+h.push('    var res = await fetch("/api/memos/" + id + "/star", { method: "PUT" });');
+h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
+h.push('    if (res.ok) {');
+h.push('      var memo = await res.json();');
+h.push('      for (var i = 0; i < memosCache.length; i++) {');
+h.push('        if (memosCache[i].id === id) { memosCache[i] = memo; break; }');
+h.push('      }');
+h.push('      renderMemoList();');
+h.push('    }');
+h.push('  } catch(e) { toast("网络错误"); }');
+h.push('}');
+h.push('');
+h.push('// ── 文件夹操作 ───');
+h.push('function selectFolder(id) {');
   h.push('  currentFolder = id;');
   h.push('  // 更新 sidebar 高亮');
   h.push('  document.querySelectorAll("[data-folder]").forEach(function(el) {');
@@ -1569,18 +1651,31 @@ h.push('    } else {');
   h.push('  } catch(e) { toast("网络错误"); }');
   h.push('}');
   h.push('');
-  h.push('function updateFolderSelect() {');
-  h.push('  var select = memoFolder;');
-  h.push('  if (!select) return;');
-  h.push('  var value = select.value;');
-  h.push('  select.innerHTML = "<option value=\\"\\">无分类</option>";');
+  h.push('function updateFolderCheckboxes() {');
+  h.push('  var container = document.getElementById("memoFolders");');
+  h.push('  if (!container) return;');
+  h.push('  container.innerHTML = "";');
+  h.push('  if (!foldersCache.length) {');
+  h.push('    container.innerHTML = "<span style=\\"font-size:13px;color:var(--text-muted)\\">暂无分类</span>";');
+  h.push('    return;');
+  h.push('  }');
   h.push('  foldersCache.forEach(function(f) {');
-  h.push('    var opt = document.createElement("option");');
-  h.push('    opt.value = f.id;');
-  h.push('    opt.textContent = f.name;');
-  h.push('    select.appendChild(opt);');
+  h.push('    var label = document.createElement("label");');
+  h.push('    var cb = document.createElement("input");');
+  h.push('    cb.type = "checkbox";');
+  h.push('    cb.value = f.id;');
+  h.push('    label.appendChild(cb);');
+  h.push('    label.appendChild(document.createTextNode(" " + f.name));');
+  h.push('    container.appendChild(label);');
   h.push('  });');
-  h.push('  select.value = value;');
+  h.push('}');
+  h.push('');
+  h.push('function getSelectedFolders() {');
+  h.push('  var ids = [];');
+  h.push('  document.querySelectorAll("#memoFolders input:checked").forEach(function(cb) {');
+  h.push('    ids.push(cb.value);');
+  h.push('  });');
+  h.push('  return ids.length ? ids : null;');
   h.push('}');
   h.push('');
   h.push('// ── 事件绑定 ───');
@@ -1592,7 +1687,7 @@ h.push('    } else {');
   h.push('});');
   h.push('document.getElementById("folderSaveBtn").addEventListener("click", saveFolder);');
   h.push('// 侧边栏「所有备忘录」和「未分类」点击');
-  h.push('document.querySelectorAll("[data-folder=\\"all\\"],[data-folder=\\"none\\"],[data-folder=\\"shared\\"]").forEach(function(el) {');
+  h.push('document.querySelectorAll("[data-folder=\\"all\\"],[data-folder=\\"starred\\"],[data-folder=\\"none\\"],[data-folder=\\"shared\\"]").forEach(function(el) {');
   h.push('  el.addEventListener("click", function() { selectFolder(el.dataset.folder); });');
   h.push('});');
   h.push('document.getElementById("folderName").addEventListener("keydown", function(e) {');
@@ -1740,6 +1835,7 @@ h.push('    } else {');
   h.push('  batchMode = !batchMode;');
   h.push('  document.body.classList.toggle("batch-active", batchMode);');
   h.push('  document.getElementById("batchBar").style.display = batchMode ? "flex" : "none";');
+  h.push('  this.classList.toggle("active", batchMode);');
   h.push('  this.textContent = batchMode ? "\\u2612" : "\\u2610";');
   h.push('  this.title = batchMode ? "\\u9000\\u51fa\\u6279\\u91cf" : "\\u6279\\u91cf\\u64cd\\u4f5c";');
   h.push('  if (!batchMode) { selectedIds = {}; }');
