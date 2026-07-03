@@ -163,6 +163,13 @@ export default {
         if (method === 'PUT') return handleMoveMemo(request, memoId, env);
       }
 
+      if (path.startsWith('/api/memos/') && path.endsWith('/share')) {
+        const memoId = path.slice('/api/memos/'.length, -'/share'.length);
+        if (!memoId) return json({ error: 'Missing memo id' }, 400);
+        if (method === 'POST') return handleShareMemo(memoId, env);
+        if (method === 'DELETE') return handleUnshareMemo(memoId, env);
+      }
+
       if (path === '/api/memos') {
         if (method === 'GET') return handleListMemos(user, env);
         if (method === 'POST') return handleCreateMemo(request, env);
@@ -185,6 +192,12 @@ export default {
       }
 
       return json({ error: 'Not Found' }, 404);
+    }
+
+    // ── 分享页（无需认证）─
+    if (path.startsWith('/share/')) {
+      const token = path.slice('/share/'.length);
+      if (token) return serveSharePage(token, env);
     }
 
     // ── 静态页面 ──────────────────────────────────
@@ -425,6 +438,11 @@ async function handleDeleteMemo(memoId, env) {
   if (!existing) {
     return json({ error: 'Memo not found' }, 404);
   }
+  let memo;
+  try { memo = JSON.parse(existing); } catch { memo = {}; }
+  if (memo.shareToken) {
+    await env.MEMOS_KV.delete('share:' + memo.shareToken).catch(function(){});
+  }
   await env.MEMOS_KV.delete('memo:' + memoId);
   return json({ ok: true });
 }
@@ -441,6 +459,76 @@ async function handleGetMemo(memoId, env) {
   } catch {
     return json({ error: 'Memo data corrupted' }, 500);
   }
+}
+
+// ── 分享 ──────────────────────────────────────────────────────────
+async function handleShareMemo(memoId, env) {
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(memoId)) {
+    return json({ error: 'Invalid memo id' }, 400);
+  }
+  const existing = await env.MEMOS_KV.get('memo:' + memoId);
+  if (!existing) return json({ error: 'Memo not found' }, 404);
+  let memo;
+  try { memo = JSON.parse(existing); } catch { return json({ error: 'Memo data corrupted' }, 500); }
+  if (memo.shareToken) {
+    return json({ url: '/share/' + memo.shareToken, shareToken: memo.shareToken });
+  }
+  const token = crypto.randomUUID();
+  memo.shareToken = token;
+  await Promise.all([
+    env.MEMOS_KV.put('share:' + token, memoId),
+    env.MEMOS_KV.put('memo:' + memoId, JSON.stringify(memo)),
+  ]);
+  return json({ url: '/share/' + token, shareToken: token });
+}
+
+async function handleUnshareMemo(memoId, env) {
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(memoId)) {
+    return json({ error: 'Invalid memo id' }, 400);
+  }
+  const existing = await env.MEMOS_KV.get('memo:' + memoId);
+  if (!existing) return json({ error: 'Memo not found' }, 404);
+  let memo;
+  try { memo = JSON.parse(existing); } catch { return json({ error: 'Memo data corrupted' }, 500); }
+  if (memo.shareToken) {
+    await Promise.all([
+      env.MEMOS_KV.delete('share:' + memo.shareToken),
+      env.MEMOS_KV.put('memo:' + memoId, JSON.stringify(Object.assign({}, memo, { shareToken: undefined }))),
+    ]);
+  }
+  return json({ ok: true });
+}
+
+function serveSharePage(token, env) {
+  return env.MEMOS_KV.get('share:' + token).then(function(memoId) {
+    if (!memoId) {
+      return new Response('分享不存在或已失效', { status: 404, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
+    }
+    return env.MEMOS_KV.get('memo:' + memoId).then(function(raw) {
+      if (!raw) {
+        return new Response('分享内容不存在', { status: 404, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
+      }
+      var memo;
+      try { memo = JSON.parse(raw); } catch {
+        return new Response('内容加载失败', { status: 500, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
+      }
+      var title = memo.title || '备忘录';
+      var safeTitle = title.replace(/</g, '&lt;');
+      var content = (memo.content || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      var time = new Date(memo.updatedAt).toLocaleString('zh-CN');
+      var html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" id="themeColor" content="#ffffff"><title>' + safeTitle + '</title><style>:root{--bg:#fff;--text:#333;--text-secondary:#999;--surface:#f5f5f7;--border:#e5e5e7;--primary:#667eea;--primary-hover:#5a6fd6}[data-theme=dark]{--bg:#1a1a2e;--text:#e0e0e0;--text-secondary:#888;--surface:#16213e;--border:#2a2a4a;--primary:#7c8cf0;--primary-hover:#6a7be0}@media(prefers-color-scheme:dark){:root:not([data-theme]){--bg:#1a1a2e;--text:#e0e0e0;--text-secondary:#888;--surface:#16213e;--border:#2a2a4a;--primary:#7c8cf0;--primary-hover:#6a7be0}}body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:720px;margin:0 auto;padding:24px 20px;color:var(--text);background:var(--bg);line-height:1.7;transition:color .2s,background .2s}h1{font-size:22px;margin-bottom:8px}.content{font-size:15px;white-space:pre-wrap;margin-bottom:24px;word-break:break-word;color:var(--text)}.time{color:var(--text-secondary);font-size:12px;margin-bottom:32px}.theme-btn{position:fixed;top:16px;right:16px;width:36px;height:36px;border:none;border-radius:8px;background:var(--surface);color:var(--text);font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);transition:all .15s;z-index:10}.theme-btn:hover{background:var(--border)}.copy-btn{display:inline-block;padding:10px 24px;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;transition:background .15s}.copy-btn:hover{background:var(--primary-hover)}</style></head><body><button class="theme-btn" id="themeBtn" title="切换主题">🌙</button><h1>' + safeTitle + '</h1><div class="time">更新于 ' + time.replace(/</g, '&lt;') + '</div><div class="content">' + content + '</div><button class="copy-btn" id="copyBtn">复制全文</button><script>(function(){var t=document.documentElement,s=localStorage.getItem("share-theme"),m=window.matchMedia("(prefers-color-scheme:dark)");function a(){var n=localStorage.getItem("share-theme");if(n)t.setAttribute("data-theme",n);else t.removeAttribute("data-theme");var e=document.getElementById("themeColor"),o=getComputedStyle(t).getPropertyValue("--bg").trim();if(e)e.content=o||"#fff";var c=document.getElementById("themeBtn");if(c){var u=n?n==="dark":m.matches;c.textContent=u?"☀️":"🌙"}}a();m.addEventListener("change",a);document.getElementById("themeBtn").addEventListener("click",function(){var n=localStorage.getItem("share-theme");if(!n||n==="light")localStorage.setItem("share-theme","dark");else if(n==="dark")localStorage.setItem("share-theme","light");a()});document.getElementById("copyBtn").addEventListener("click",function(){var t=document.querySelector("h1").textContent+"\\n"+document.querySelector(".content").textContent;navigator.clipboard.writeText(t).then(function(){this.textContent="已复制"}.bind(this),function(){this.textContent="复制失败"}.bind(this))});})();</script></body></html>';
+      return new Response(html, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/html; charset=UTF-8',
+          'X-Content-Type-Options': 'nosniff',
+          'X-Frame-Options': 'DENY',
+          'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline' 'self'; script-src 'unsafe-inline' 'self'",
+          'Cache-Control': 'public, max-age=5',
+        },
+      });
+    });
+  });
 }
 
 // ── 文件夹 CRUD ──────────────────────────────────────────────────
@@ -740,6 +828,9 @@ function serveAppPage() {
   h.push('  .header button { padding:6px 14px; border:none; border-radius:var(--radius-sm); font-size:13px; cursor:pointer; font-weight:500; transition:all .15s; }');
   h.push('  .btn-new { background:var(--primary); color:#fff; font-size:18px; padding:4px 10px; line-height:1.4; border-radius:50%; }');
   h.push('  .btn-new:hover { background:var(--primary-hover); transform:scale(1.05); }');
+  h.push('  .btn-batch { background:var(--surface-hover); color:var(--primary); border:1px dashed var(--primary); font-size:13px; padding:5px 12px; border-radius:var(--radius-sm); cursor:pointer; font-weight:500; transition:all .15s; white-space:nowrap; }');
+  h.push('  .btn-batch:hover { background:var(--primary); color:#fff; border-style:solid; }');
+  h.push('  .btn-batch.active { background:var(--primary); color:#fff; border-style:solid; }');
   h.push('  .btn-logout { background:var(--surface-hover); color:var(--text-secondary); }');
   h.push('  .btn-logout:hover { background:var(--border); }');
   h.push('  .btn-theme { background:none; border:1px solid var(--border); color:var(--text-muted); font-size:16px; cursor:pointer; padding:4px 8px; border-radius:6px; line-height:1; }');
@@ -767,8 +858,9 @@ function serveAppPage() {
   h.push('  .folder-actions button:hover { background:var(--border); color:var(--text); }');
   h.push('  .main-content { flex:1; min-width:0; }');
   h.push('  .container { max-width:800px; margin:0 auto; padding:20px 24px; }');
-  h.push('  .memo-card { background:var(--surface); border-radius:var(--radius); padding:20px; margin-bottom:12px; box-shadow:var(--shadow); transition:box-shadow .2s, transform .15s; position:relative; border:1px solid var(--border); }');
-  h.push('  .memo-card:hover { box-shadow:var(--shadow-hover); transform:translateY(-1px); }');
+  h.push('  .memo-card { background:var(--surface); border-radius:var(--radius); padding:20px; margin-bottom:12px; box-shadow:var(--shadow); transition:box-shadow .2s, transform .15s, border-color .2s; position:relative; border:1px solid var(--border); }');
+  h.push('  .memo-card:hover { box-shadow:var(--shadow-hover); transform:translateY(-1px); border-color:var(--primary); }');
+  h.push('  .memo-card.shared-card { border-left:3px solid #22c55e; }');
   h.push('  .memo-card h3 { margin-bottom:8px; font-size:16px; color:var(--text); display:flex; align-items:center; gap:8px; }');
   h.push('  .memo-card h3 .memo-folder { font-size:11px; color:var(--primary); background:var(--primary-light); padding:1px 8px; border-radius:10px; font-weight:400; }');
   h.push('  .memo-card p { color:var(--text-secondary); font-size:14px; line-height:1.7; white-space:pre-wrap; }');
@@ -777,6 +869,9 @@ function serveAppPage() {
   h.push('  .memo-card:hover .card-actions { opacity:1; }');
   h.push('  .card-actions button { background:var(--surface-hover); border:none; font-size:14px; cursor:pointer; padding:4px 6px; border-radius:4px; color:var(--text-muted); line-height:1; transition:all .1s; }');
   h.push('  .card-actions button:hover { background:var(--border); color:var(--text); }');
+  h.push('  .drag-handle { cursor:grab; color:var(--text-tertiary); font-size:16px; line-height:1; padding:2px 4px; border-radius:4px; user-select:none; -webkit-user-drag:element; position:absolute; top:10px; right:10px; opacity:0; transition:opacity .15s; }');
+  h.push('  .memo-card:hover .drag-handle, .drag-handle:active { opacity:1; }');
+  h.push('  .drag-handle:active { cursor:grabbing; color:var(--primary); background:var(--surface-hover); }');
   h.push('  .memo-card.dragging { opacity:0.5; }');
   h.push('  .empty { text-align:center; color:var(--text-muted); padding:80px 20px; font-size:14px; line-height:1.8; }');
   h.push('  .empty .empty-icon { font-size:48px; margin-bottom:16px; display:block; }');
@@ -803,9 +898,24 @@ function serveAppPage() {
   h.push('  .btn-delete-inline { background:#ef4444; color:#fff; margin-right:auto; }');
   h.push('  .btn-delete-inline:hover { background:#dc2626; }');
   h.push('  .folder-modal .modal { max-width:400px; }');
+  h.push('  /* Share toggle */');
+  h.push('  .share-row { display:flex; align-items:center; gap:12px; cursor:pointer; user-select:none; }');
+  h.push('  .toggle { width:44px; height:24px; background:#ddd; border-radius:12px; position:relative; cursor:pointer; transition:background .2s; flex-shrink:0; }');
+  h.push('  [data-theme="dark"] .toggle { background:#3a3a5a; }');
+  h.push('  .toggle.on { background:var(--primary); }');
+  h.push('  .toggle-knob { width:20px; height:20px; background:#fff; border-radius:50%; position:absolute; top:2px; left:2px; transition:transform .2s; box-shadow:0 1px 3px rgba(0,0,0,.2); }');
+  h.push('  .toggle.on .toggle-knob { transform:translateX(20px); }');
+  h.push('  .share-url-row { display:flex; gap:8px; margin-top:8px; }');
+  h.push('  .share-url-input { flex:1; padding:8px 10px; border:1px solid var(--border); border-radius:var(--radius-sm); font-size:13px; color:var(--text); background:var(--surface); min-width:0; }');
+  h.push('  .share-url-input:focus { outline:none; border-color:var(--primary); }');
+  h.push('  .share-copy-btn { padding:8px 14px; background:var(--primary); color:#fff; border:none; border-radius:var(--radius-sm); font-size:13px; cursor:pointer; white-space:nowrap; flex-shrink:0; }');
+  h.push('  .share-copy-btn:hover { background:var(--primary-hover); }');
+  h.push('  .share-copy-btn.copied { background:#22c55e; }');
   h.push('  /* Toast */');
-  h.push('  .toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); z-index:200; padding:10px 24px; border-radius:10px; font-size:14px; color:#fff; background:#1f2937; box-shadow:0 4px 16px rgba(0,0,0,.2); animation:toastIn .25s ease; pointer-events:none; }');
+  h.push('  .toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); z-index:200; padding:10px 24px; border-radius:10px; font-size:14px; color:#fff; background:#1f2937; box-shadow:0 4px 16px rgba(0,0,0,.2); animation:toastIn .25s ease; pointer-events:none; display:flex; align-items:center; gap:8px; }');
   h.push('  [data-theme="dark"] .toast { background:#374151; }');
+  h.push('  .toast.success { background:#16a34a; }');
+  h.push('  .toast.error { background:#dc2626; }');
   h.push('  .toast.leave { animation:toastOut .2s ease forwards; }');
   h.push('  @keyframes toastIn { from{opacity:0;transform:translateX(-50%) translateY(16px)} to{opacity:1;transform:translateX(-50%) translateY(0)} }');
   h.push('  @keyframes toastOut { from{opacity:1} to{opacity:0;transform:translateX(-50%) translateY(16px)} }');
@@ -814,6 +924,22 @@ function serveAppPage() {
   h.push('  .folder-item.drag-over { background:var(--primary-light); }');
   h.push('  .folder-item.drag-over .folder-name { color:var(--primary); }');
   h.push('  .memo-card h3, .memo-card p { overflow-wrap:break-word; word-break:break-word; }');
+  h.push('  /* Share button active state */');
+  h.push('  .share-btn.shared { color:#22c55e; background:#e8fce8; }');
+  h.push('  [data-theme="dark"] .share-btn.shared { background:#1a3a1a; }');
+  h.push('  /* Batch mode */');
+  h.push('  .batch-bar { display:flex; align-items:center; gap:10px; padding:10px 24px; background:var(--surface); border-bottom:1px solid var(--border); flex-wrap:wrap; }');
+  h.push('  .batch-bar .batch-select-all { display:flex; align-items:center; gap:6px; font-size:13px; color:var(--text-secondary); cursor:pointer; }');
+  h.push('  .batch-bar .batch-count { font-size:12px; color:var(--text-muted); }');
+  h.push('  .batch-btn { padding:6px 14px; border:none; border-radius:var(--radius-sm); font-size:13px; cursor:pointer; background:var(--primary); color:#fff; font-weight:500; }');
+  h.push('  .batch-btn:hover { opacity:.85; }');
+  h.push('  .batch-btn-danger { background:#ef4444; }');
+  h.push('  .batch-btn-cancel { background:var(--surface-hover); color:var(--text-secondary); }');
+  h.push('  .memo-card .batch-checkbox { display:none; position:absolute; top:16px; left:16px; z-index:2; }');
+  h.push('  .batch-checkbox input { width:18px; height:18px; cursor:pointer; accent-color:var(--primary); }');
+  h.push('  body.batch-active .memo-card .card-actions { display:none; }');
+  h.push('  body.batch-active .memo-card .batch-checkbox { display:block; }');
+  h.push('  body.batch-active .memo-card h3 { margin-left:28px; }');
   h.push('  /* Responsive */');
   h.push('  @media (max-width:768px) {');
     h.push('    .app-layout { flex-direction:column; }');
@@ -828,6 +954,7 @@ function serveAppPage() {
   h.push('    .header { padding:0 12px; gap:8px; }');
   h.push('    .header .search-box { max-width:none; }');
   h.push('    .container { padding:12px; }');
+  h.push('    .batch-bar { padding:8px 12px; gap:6px; }');
   h.push('    .memo-card { padding:16px; }');
   h.push('    .memo-card .card-actions { opacity:1; }');
   h.push('    .header .user { display:none; }');
@@ -842,8 +969,9 @@ function serveAppPage() {
   h.push('  </div>');
   h.push('  <div class="actions">');
   h.push('    <span class="user" id="usernameDisplay"></span>');
-  h.push('    <button class="btn-new" id="newMemoBtn">\u{FF0B}</button>');
-  h.push('    <button class="btn-theme" id="themeToggle" title="切换深色模式">🌙</button>');
+    h.push('    <button class="btn-batch" id="batchModeBtn">☐ 批量</button>');
+    h.push('    <button class="btn-new" id="newMemoBtn">\u{FF0B}</button>');
+    h.push('    <button class="btn-theme" id="themeToggle" title="切换深色模式">🌙</button>');
   h.push('    <button class="btn-logout" id="logoutBtn">退出</button>');
   h.push('  </div>');
   h.push('</div>');
@@ -858,13 +986,25 @@ function serveAppPage() {
   h.push('      <span class="folder-icon">📋</span>');
   h.push('      <span class="folder-name">所有备忘录</span>');
   h.push('    </div>');
-  h.push('    <div class="folder-item" data-folder="none">');
-  h.push('      <span class="folder-icon">📄</span>');
-  h.push('      <span class="folder-name">未分类</span>');
-  h.push('    </div>');
+    h.push('    <div class="folder-item" data-folder="none">');
+    h.push('      <span class="folder-icon">📄</span>');
+    h.push('      <span class="folder-name">未分类</span>');
+    h.push('    </div>');
+    h.push('    <div class="folder-item" data-folder="shared">');
+    h.push('      <span class="folder-icon">🔗</span>');
+    h.push('      <span class="folder-name">已分享</span>');
+    h.push('    </div>');
   h.push('    <div id="folderList"></div>');
   h.push('  </div>');
   h.push('  <div class="main-content">');
+  h.push('    <div class="batch-bar" id="batchBar" style="display:none">');
+  h.push('      <label class="batch-select-all"><input type="checkbox" id="batchSelectAll"> 全选</label>');
+  h.push('      <span class="batch-count" id="batchCount">已选 0 项</span>');
+  h.push('      <button class="batch-btn" id="batchShare">分享</button>');
+  h.push('      <button class="batch-btn" id="batchUnshare">取消分享</button>');
+  h.push('      <button class="batch-btn batch-btn-danger" id="batchDelete">删除</button>');
+  h.push('      <button class="batch-btn batch-btn-cancel" id="batchCancel">关闭</button>');
+  h.push('    </div>');
   h.push('    <div class="container" id="memoList"></div>');
   h.push('  </div>');
   h.push('</div>');
@@ -888,14 +1028,24 @@ function serveAppPage() {
   h.push('      <select id="memoFolder">');
   h.push('        <option value="">无分类</option>');
   h.push('      </select>');
-  h.push('    </div>');
-  h.push('    <div class="modal-btns">');
-  h.push('      <button class="btn-delete-inline" id="deleteMemoBtn" style="display:none;">删除</button>');
-  h.push('      <button class="btn-cancel" id="cancelBtn">取消</button>');
-  h.push('      <button class="btn-save" id="saveBtn">保存</button>');
-  h.push('    </div>');
-  h.push('  </div>');
-  h.push('</div>');
+    h.push('    </div>');
+    h.push('    <div class="field share-field" style="display:none">');
+    h.push('      <label class="share-row">');
+    h.push('        <span>公开分享</span>');
+    h.push('        <div class="toggle" id="shareToggle" role="switch" tabindex="0"><div class="toggle-knob"></div></div>');
+    h.push('      </label>');
+    h.push('      <div id="shareUrlRow" style="display:none">');
+    h.push('        <input class="share-url-input" id="shareUrl" readonly onclick="this.select()">');
+    h.push('        <button class="share-copy-btn" id="shareCopyBtn">复制</button>');
+    h.push('      </div>');
+    h.push('    </div>');
+    h.push('    <div class="modal-btns">');
+    h.push('      <button class="btn-delete-inline" id="deleteMemoBtn" style="display:none;">删除</button>');
+    h.push('      <button class="btn-cancel" id="cancelBtn">取消</button>');
+    h.push('      <button class="btn-save" id="saveBtn">保存</button>');
+    h.push('    </div>');
+    h.push('  </div>');
+    h.push('</div>');
   h.push('');
   h.push('<!-- 文件夹模态框 -->');
   h.push('<div class="modal-overlay folder-modal" id="folderModal">');
@@ -922,6 +1072,8 @@ function serveAppPage() {
   h.push('var currentFolder = "all";');
   h.push('var searchQuery = "";');
   h.push('var isSaving = false;');
+  h.push('var batchMode = false;');
+  h.push('var selectedIds = {};');
   h.push('');
   h.push('async function init() {');
   h.push('  try {');
@@ -1002,6 +1154,8 @@ h.push('');
   h.push('  var filtered = memosCache;');
   h.push('  if (currentFolder === "none") {');
   h.push('    filtered = memosCache.filter(function(m) { return !m.folderId; });');
+  h.push('  } else if (currentFolder === "shared") {');
+  h.push('    filtered = memosCache.filter(function(m) { return m.shareToken; });');
   h.push('  } else if (currentFolder !== "all") {');
   h.push('    filtered = memosCache.filter(function(m) { return m.folderId === currentFolder; });');
   h.push('  }');
@@ -1014,7 +1168,11 @@ h.push('');
   h.push('  }');
   h.push('  container.innerHTML = filtered.map(function(m) {');
   h.push('    var date = new Date(m.updatedAt).toLocaleString("zh-CN");');
-  h.push('    var card = "<div class=\\"memo-card\\" draggable=\\"true\\" data-memo-id=\\"" + m.id + "\\">";');
+  h.push('    var shareCls = m.shareToken ? " shared" : "";');
+    h.push('    var cardCls = "memo-card" + (m.shareToken ? " shared-card" : "");');
+  h.push('    var card = "<div class=\\"" + cardCls + "\\" data-memo-id=\\"" + m.id + "\\">";');
+  h.push('    card += "<label class=\\"batch-checkbox\\"><input type=\\"checkbox\\" data-batch=\\"" + m.id + "\\"></label>";');
+  h.push('    card += "<span class=\\"drag-handle\\" draggable=\\"true\\" title=\\"拖拽移动\\">⠿</span>";');
   h.push('    var folderName = "";');
   h.push('    if (m.folderId) {');
   h.push('      var f = foldersCache.find(function(f) { return f.id === m.folderId; });');
@@ -1028,9 +1186,10 @@ h.push('');
   h.push('    }');
   h.push('    card += "<div class=\\"time\\">更新于 " + date + "</div>";');
   h.push('    card += "<div class=\\"card-actions\\">";');
-  h.push('    card += "<button title=\\"编辑\\" data-edit=\\"" + m.id + "\\">\u270F\uFE0F</button>";');
-  h.push('    card += "<button title=\\"复制\\" data-copy=\\"" + m.id + "\\">\uD83D\uDCCB</button>";');
-  h.push('    card += "<button title=\\"删除\\" data-delete=\\"" + m.id + "\\">\uD83D\uDDD1\uFE0F</button>";');
+    h.push('    card += "<button title=\\"编辑\\" data-edit=\\"" + m.id + "\\">\u270F\uFE0F</button>";');
+    h.push('    card += "<button class=\\"share-btn" + shareCls + "\\" title=\\"分享\\" data-share=\\"" + m.id + "\\">\uD83D\uDD17</button>";');
+    h.push('    card += "<button title=\\"复制\\" data-copy=\\"" + m.id + "\\">\uD83D\uDCCB</button>";');
+    h.push('    card += "<button title=\\"删除\\" data-delete=\\"" + m.id + "\\">\uD83D\uDDD1\uFE0F</button>";');
   h.push('    card += "</div>";');
   h.push('    card += "</div>";');
   h.push('    return card;');
@@ -1041,17 +1200,22 @@ h.push('');
   h.push('  container.querySelectorAll("[data-delete]").forEach(function(btn) {');
   h.push('    btn.addEventListener("click", function() { deleteMemoDirect(btn.dataset.delete); });');
   h.push('  });');
+  h.push('  container.querySelectorAll("[data-share]").forEach(function(btn) {');
+  h.push('    btn.addEventListener("click", function() { shareMemo(btn.dataset.share); });');
+  h.push('  });');
   h.push('  container.querySelectorAll("[data-copy]").forEach(function(btn) {');
   h.push('    btn.addEventListener("click", function() { copyMemoContent(btn.dataset.copy); });');
   h.push('  });');
   h.push('  // 拖拽支持');
-  h.push('  container.querySelectorAll(".memo-card[draggable]").forEach(function(card) {');
-  h.push('    card.addEventListener("dragstart", function(e) {');
+  h.push('  container.querySelectorAll(".drag-handle[draggable]").forEach(function(handle) {');
+  h.push('    handle.addEventListener("dragstart", function(e) {');
+  h.push('      var card = handle.closest(".memo-card");');
   h.push('      e.dataTransfer.setData("text/memo-id", card.dataset.memoId);');
   h.push('      card.classList.add("dragging");');
   h.push('    });');
-  h.push('    card.addEventListener("dragend", function() {');
-  h.push('      card.classList.remove("dragging");');
+  h.push('    handle.addEventListener("dragend", function() {');
+  h.push('      var card = handle.closest(".memo-card");');
+  h.push('      if (card) card.classList.remove("dragging");');
   h.push('    });');
   h.push('  });');
   h.push('  // 未分类（sidebar空白）作为拖拽目标');
@@ -1122,6 +1286,8 @@ h.push('function escapeHtml(text) {');
   h.push('  memoContent.value = "";');
   h.push('  memoFolder.value = (currentFolder !== "all" && currentFolder !== "none") ? currentFolder : "";');
   h.push('  deleteBtn.style.display = "none";');
+  h.push('  var shareField = document.querySelector(".share-field");');
+  h.push('  if (shareField) shareField.style.display = "none";');
   h.push('  modalOverlay.classList.add("active");');
   h.push('  updateCharCount();');
   h.push('  autoResizeTextarea();');
@@ -1146,6 +1312,21 @@ h.push('function escapeHtml(text) {');
   h.push('    memoTitle.value = memo.title;');
   h.push('    memoContent.value = memo.content;');
   h.push('    memoFolder.value = memo.folderId || "";');
+  h.push('    var shareField = document.querySelector(".share-field");');
+  h.push('    if (shareField) {');
+  h.push('      shareField.style.display = "block";');
+  h.push('      var shareToggle = document.getElementById("shareToggle");');
+  h.push('      var shareUrl = document.getElementById("shareUrl");');
+  h.push('      var shareUrlRow = document.getElementById("shareUrlRow");');
+  h.push('      if (memo.shareToken) {');
+  h.push('        shareToggle.classList.add("on");');
+  h.push('        shareUrl.value = location.origin + "/share/" + memo.shareToken;');
+  h.push('        shareUrlRow.style.display = "flex";');
+  h.push('      } else {');
+  h.push('        shareToggle.classList.remove("on");');
+  h.push('        shareUrlRow.style.display = "none";');
+  h.push('      }');
+  h.push('    }');
   h.push('  } else {');
   h.push('    toast("该备忘录不存在或已被删除");');
   h.push('    closeModal();');
@@ -1246,6 +1427,36 @@ h.push('    } else {');
   h.push('  }, function() {');
   h.push('    toast("复制失败，请手动复制");');
   h.push('  });');
+  h.push('}');
+  h.push('');
+  h.push('async function shareMemo(id) {');
+  h.push('  var memo = memosCache.find(function(m) { return m.id === id; });');
+  h.push('  if (memo && memo.shareToken) {');
+  h.push('    var url = location.origin + "/share/" + memo.shareToken;');
+  h.push('    navigator.clipboard.writeText(url).then(function() {');
+  h.push('      toast("分享链接已复制到剪贴板");');
+  h.push('    }, function() {');
+  h.push('      toast("复制失败，链接: " + url);');
+  h.push('    });');
+  h.push('    return;');
+  h.push('  }');
+  h.push('  try {');
+  h.push('    var res = await fetch("/api/memos/" + id + "/share", { method: "POST" });');
+  h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
+  h.push('    if (res.ok) {');
+  h.push('      var data = await res.json();');
+  h.push('      for (var i = 0; i < memosCache.length; i++) {');
+  h.push('        if (memosCache[i].id === id) { memosCache[i].shareToken = data.shareToken; break; }');
+  h.push('      }');
+  h.push('      var url = location.origin + data.url;');
+  h.push('      navigator.clipboard.writeText(url).then(function() {');
+  h.push('        toast("分享链接已复制到剪贴板");');
+  h.push('      }, function() {');
+  h.push('        toast("复制失败，链接: " + url);');
+  h.push('      });');
+  h.push('      renderMemoList();');
+  h.push('    } else { toast("创建分享失败"); }');
+  h.push('  } catch(e) { toast("网络错误"); }');
   h.push('}');
   h.push('');
   h.push('// ── 文件夹操作 ───');
@@ -1381,16 +1592,62 @@ h.push('    } else {');
   h.push('});');
   h.push('document.getElementById("folderSaveBtn").addEventListener("click", saveFolder);');
   h.push('// 侧边栏「所有备忘录」和「未分类」点击');
-  h.push('document.querySelectorAll("[data-folder=\\"all\\"],[data-folder=\\"none\\"]").forEach(function(el) {');
+  h.push('document.querySelectorAll("[data-folder=\\"all\\"],[data-folder=\\"none\\"],[data-folder=\\"shared\\"]").forEach(function(el) {');
   h.push('  el.addEventListener("click", function() { selectFolder(el.dataset.folder); });');
   h.push('});');
   h.push('document.getElementById("folderName").addEventListener("keydown", function(e) {');
   h.push('  if (e.key === "Enter") saveFolder();');
   h.push('});');
-  h.push('modalOverlay.addEventListener("click", function(e) {');
+  h.push('modalOverlay.addEventListener("mousedown", function(e) {');
   h.push('  if (e.target === modalOverlay) closeModal();');
   h.push('});');
   h.push('document.getElementById("saveBtn").addEventListener("click", saveMemo);');
+  h.push('document.getElementById("shareToggle").addEventListener("click", async function() {');
+  h.push('  var id = editMemoId.value;');
+  h.push('  if (!id) return;');
+  h.push('  var on = this.classList.contains("on");');
+  h.push('  if (on) {');
+  h.push('    if (!confirm("取消分享后，再次开启将生成新的分享链接，原有链接将不可用。\\n\\n确定取消分享吗？")) return;');
+  h.push('    try {');
+  h.push('      var res = await fetch("/api/memos/" + id + "/share", { method: "DELETE" });');
+  h.push('      if (res.ok) {');
+  h.push('        this.classList.remove("on");');
+  h.push('        document.getElementById("shareUrlRow").style.display = "none";');
+  h.push('        for (var i = 0; i < memosCache.length; i++) {');
+  h.push('          if (memosCache[i].id === id) { delete memosCache[i].shareToken; break; }');
+  h.push('        }');
+  h.push('        renderMemoList();');
+  h.push('        toast("分享已关闭");');
+  h.push('      } else { toast("关闭分享失败"); }');
+  h.push('    } catch(e) { toast("网络错误"); }');
+  h.push('  } else {');
+  h.push('    try {');
+  h.push('      var res = await fetch("/api/memos/" + id + "/share", { method: "POST" });');
+  h.push('      if (res.ok) {');
+  h.push('        var data = await res.json();');
+  h.push('        this.classList.add("on");');
+  h.push('        var shareUrl = document.getElementById("shareUrl");');
+  h.push('        shareUrl.value = location.origin + data.url;');
+  h.push('        document.getElementById("shareUrlRow").style.display = "flex";');
+  h.push('        for (var i = 0; i < memosCache.length; i++) {');
+  h.push('          if (memosCache[i].id === id) { memosCache[i].shareToken = data.shareToken; break; }');
+  h.push('        }');
+  h.push('        renderMemoList();');
+  h.push('        toast("分享已开启");');
+  h.push('      } else { toast("开启分享失败"); }');
+  h.push('    } catch(e) { toast("网络错误"); }');
+  h.push('  }');
+  h.push('});');
+  h.push('document.getElementById("shareCopyBtn").addEventListener("click", function() {');
+  h.push('  var input = document.getElementById("shareUrl");');
+  h.push('  if (!input.value) return;');
+  h.push('  navigator.clipboard.writeText(input.value).then(function() {');
+  h.push('    var btn = this;');
+  h.push('    btn.textContent = "已复制";');
+  h.push('    btn.classList.add("copied");');
+  h.push('    setTimeout(function() { btn.textContent = "复制"; btn.classList.remove("copied"); }, 2000);');
+  h.push('  }.bind(this), function() { toast("复制失败"); });');
+  h.push('});');
   h.push('document.getElementById("deleteMemoBtn").addEventListener("click", async function() {');
   h.push('  var id = editMemoId.value;');
   h.push('  if (!id || !confirm("确定要删除这条备忘录吗？")) return;');
@@ -1477,6 +1734,99 @@ h.push('    } else {');
   h.push('    }, 200);');
   h.push('  });');
   h.push('})();');
+  h.push('');
+  h.push('// 批量操作');
+  h.push('document.getElementById("batchModeBtn").addEventListener("click", function() {');
+  h.push('  batchMode = !batchMode;');
+  h.push('  document.body.classList.toggle("batch-active", batchMode);');
+  h.push('  document.getElementById("batchBar").style.display = batchMode ? "flex" : "none";');
+  h.push('  this.textContent = batchMode ? "\\u2612" : "\\u2610";');
+  h.push('  this.title = batchMode ? "\\u9000\\u51fa\\u6279\\u91cf" : "\\u6279\\u91cf\\u64cd\\u4f5c";');
+  h.push('  if (!batchMode) { selectedIds = {}; }');
+  h.push('  renderMemoList();');
+  h.push('});');
+  h.push('document.getElementById("batchSelectAll").addEventListener("change", function() {');
+  h.push('  var boxes = document.querySelectorAll("[data-batch]");');
+  h.push('  boxes.forEach(function(box) {');
+  h.push('    box.checked = this.checked;');
+  h.push('    if (this.checked) { selectedIds[box.dataset.batch] = true; }');
+  h.push('    else { delete selectedIds[box.dataset.batch]; }');
+  h.push('  }.bind(this));');
+  h.push('  document.getElementById("batchCount").textContent = "\\u5df2\\u9009 " + Object.keys(selectedIds).length + " \\u9879";');
+  h.push('});');
+  h.push('document.addEventListener("change", function(e) {');
+  h.push('  var box = e.target;');
+  h.push('  if (box.matches("[data-batch]")) {');
+  h.push('    if (box.checked) { selectedIds[box.dataset.batch] = true; }');
+  h.push('    else { delete selectedIds[box.dataset.batch]; }');
+  h.push('    document.getElementById("batchCount").textContent = "\\u5df2\\u9009 " + Object.keys(selectedIds).length + " \\u9879";');
+  h.push('  }');
+  h.push('});');
+  h.push('function getSelectedIds() {');
+  h.push('  return Object.keys(selectedIds);');
+  h.push('}');
+  h.push('async function batchShare() {');
+  h.push('  var ids = getSelectedIds();');
+  h.push('  if (ids.length === 0) { toast("\\u8bf7\\u9009\\u62e9\\u5907\\u5fd8\\u5f55"); return; }');
+  h.push('  var ok = 0, fail = 0;');
+  h.push('  for (var i = 0; i < ids.length; i++) {');
+  h.push('    try {');
+  h.push('      var res = await fetch("/api/memos/" + ids[i] + "/share", { method: "POST" });');
+  h.push('      if (res.ok) {');
+  h.push('        var data = await res.json();');
+  h.push('        for (var j = 0; j < memosCache.length; j++) {');
+  h.push('          if (memosCache[j].id === ids[i]) { memosCache[j].shareToken = data.shareToken; break; }');
+  h.push('        }');
+  h.push('        ok++;');
+  h.push('      } else { fail++; }');
+  h.push('    } catch(e) { fail++; }');
+  h.push('  }');
+  h.push('  toast("\\u5df2\\u5206\\u4eab " + ok + " \\u9879" + (fail ? "\\uff0c\\u5931\\u8d25 " + fail + " \\u9879" : ""));');
+  h.push('  renderMemoList();');
+  h.push('}');
+  h.push('async function batchUnshare() {');
+  h.push('  var ids = getSelectedIds();');
+  h.push('  if (ids.length === 0) { toast("\\u8bf7\\u9009\\u62e9\\u5907\\u5fd8\\u5f55"); return; }');
+  h.push('  if (!confirm("\\u786e\\u5b9a\\u53d6\\u6d88\\u9009\\u4e2d\\u7684 " + ids.length + " \\u9879\\u5206\\u4eab\\u5417\\uff1f\\n\\n\\u91cd\\u65b0\\u5206\\u4eab\\u5c06\\u751f\\u6210\\u65b0\\u94fe\\u63a5\\uff0c\\u539f\\u6709\\u94fe\\u63a5\\u4e0d\\u53ef\\u7528\\u3002")) return;');
+  h.push('  var ok = 0, fail = 0;');
+  h.push('  for (var i = 0; i < ids.length; i++) {');
+  h.push('    try {');
+  h.push('      var res = await fetch("/api/memos/" + ids[i] + "/share", { method: "DELETE" });');
+  h.push('      if (res.ok) {');
+  h.push('        for (var j = 0; j < memosCache.length; j++) {');
+  h.push('          if (memosCache[j].id === ids[i]) { delete memosCache[j].shareToken; break; }');
+  h.push('        }');
+  h.push('        ok++;');
+  h.push('      } else { fail++; }');
+  h.push('    } catch(e) { fail++; }');
+  h.push('  }');
+  h.push('  toast("\\u5df2\\u53d6\\u6d88\\u5206\\u4eab " + ok + " \\u9879" + (fail ? "\\uff0c\\u5931\\u8d25 " + fail + " \\u9879" : ""));');
+  h.push('  renderMemoList();');
+  h.push('}');
+  h.push('async function batchDelete() {');
+  h.push('  var ids = getSelectedIds();');
+  h.push('  if (ids.length === 0) { toast("\\u8bf7\\u9009\\u62e9\\u5907\\u5fd8\\u5f55"); return; }');
+  h.push('  if (!confirm("\\u786e\\u5b9a\\u8981\\u5220\\u9664\\u9009\\u4e2d\\u7684 " + ids.length + " \\u6761\\u5907\\u5fd8\\u5f55\\u5417\\uff1f")) return;');
+  h.push('  var ok = 0, fail = 0;');
+  h.push('  for (var i = 0; i < ids.length; i++) {');
+  h.push('    try {');
+  h.push('      var res = await fetch("/api/memos/" + ids[i], { method: "DELETE" });');
+  h.push('      if (res.ok) {');
+  h.push('        memosCache = memosCache.filter(function(m) { return m.id !== ids[i]; });');
+  h.push('        ok++;');
+  h.push('      } else { fail++; }');
+  h.push('    } catch(e) { fail++; }');
+  h.push('  }');
+  h.push('  toast("\\u5df2\\u5220\\u9664 " + ok + " \\u9879" + (fail ? "\\uff0c\\u5931\\u8d25 " + fail + " \\u9879" : ""));');
+  h.push('  selectedIds = {};');
+  h.push('  renderMemoList();');
+  h.push('}');
+  h.push('document.getElementById("batchShare").addEventListener("click", batchShare);');
+  h.push('document.getElementById("batchUnshare").addEventListener("click", batchUnshare);');
+  h.push('document.getElementById("batchDelete").addEventListener("click", batchDelete);');
+  h.push('document.getElementById("batchCancel").addEventListener("click", function() {');
+  h.push('  document.getElementById("batchModeBtn").click();');
+  h.push('});');
   h.push('');
   h.push('init();');
   h.push('})();');
