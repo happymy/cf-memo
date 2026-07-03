@@ -1377,7 +1377,7 @@ h.push('function escapeHtml(text) {');
   h.push('    updateFolderCheckboxes();');
   h.push('    var fids = memo.folderIds || [];');
   h.push('    fids.forEach(function(fid) {');
-  h.push('      var cb = document.querySelector("#memoFolders input[value=\\"' + fid + '\\"]");');
+  h.push('      var cb = document.querySelector("#memoFolders input[value=\\"\' + fid + \'\\"]");');
   h.push('      if (cb) cb.checked = true;');
   h.push('    });');
   h.push('    var shareField = document.querySelector(".share-field");');
