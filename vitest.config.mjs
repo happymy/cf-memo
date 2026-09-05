@@ -13,6 +13,8 @@ export default defineConfig({
           USERNAME: "admin",
           PASSWORD: "memo2024",
           SESSION_SECRET: "test-secret-change-me",
+          HIDDEN_PASSWORD: "hidden2026",
+          MEMO_ENCRYPT_KEY: "h9QHxPaOyLBX1Qi5e3W4sc09+ElHK7ixcgY0YuWcWgA=",
         },
       },
     }),

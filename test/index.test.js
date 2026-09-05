@@ -1,4 +1,4 @@
-import { SELF, reset } from "cloudflare:test";
+import { SELF, reset, env } from "cloudflare:test";
 import { describe, it, expect, afterEach } from "vitest";
 
 const BASE = "http://localhost";
@@ -17,6 +17,20 @@ async function login() {
 async function authedFetch(path, opts) {
   const { cookie } = await login();
   const headers = { ...opts?.headers, Cookie: cookie };
+  return SELF.fetch(`${BASE}${path}`, { ...opts, headers });
+}
+
+// 已登录 + 已通过隐藏密码验证（携带 cf_memo_session + cf_memo_hidden 双 cookie）
+async function hiddenAuthFetch(path, opts) {
+  const { cookie: session } = await login();
+  const hauth = await SELF.fetch(`${BASE}/api/hidden-auth`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: session },
+    body: JSON.stringify({ password: "hidden2026" }),
+  });
+  expect(hauth.status).toBe(200);
+  const hiddenCookie = hauth.headers.get("Set-Cookie");
+  const headers = { ...opts?.headers, Cookie: `${session}; ${hiddenCookie}` };
   return SELF.fetch(`${BASE}${path}`, { ...opts, headers });
 }
 
@@ -240,5 +254,218 @@ describe("Star", () => {
     const list = await (await authedFetch("/api/memos")).json();
     const m = list.find(x => x.id === created.id);
     expect(m.starred).toBe(true);
+  });
+});
+
+// ── 隐藏备忘录 ───
+describe("Hidden Memo", () => {
+  async function createHidden(title, content) {
+    const res = await hiddenAuthFetch("/api/hidden-memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, content }),
+    });
+    expect(res.status).toBe(201);
+    return res.json();
+  }
+
+  it("无隐藏授权时 view=hidden 返回 403", async () => {
+    const res = await authedFetch("/api/memos?view=hidden");
+    expect(res.status).toBe(403);
+  });
+
+  it("隐藏密码错误返回 401", async () => {
+    const { cookie } = await login();
+    const res = await SELF.fetch(`${BASE}/api/hidden-auth`, {
+      method: "POST", headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ password: "wrong" }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("创建隐藏备忘录返回 hidden:true", async () => {
+    const m = await createHidden("机密", "绝密内容");
+    expect(m.hidden).toBe(true);
+    expect(m.id).toBeTruthy();
+  });
+
+  it("KV 中存储的是密文而非明文", async () => {
+    const m = await createHidden("绝密标题XYZ", "绝密内容ABC");
+    const raw = await env.MEMOS_KV.get("sc:" + m.id);
+    expect(raw).toBeTruthy();
+    expect(raw).not.toContain("绝密标题XYZ");
+    expect(raw).not.toContain("绝密内容ABC");
+  });
+
+  it("普通列表不包含隐藏备忘录", async () => {
+    await createHidden("隐藏项", "secret");
+    const list = await (await authedFetch("/api/memos")).json();
+    expect(list.length).toBe(0);
+  });
+
+  it("view=hidden 列表返回解密后的明文", async () => {
+    await createHidden("机密", "内容可见");
+    const res = await hiddenAuthFetch("/api/memos?view=hidden");
+    expect(res.status).toBe(200);
+    const list = await res.json();
+    expect(list.length).toBe(1);
+    expect(list[0].title).toBe("机密");
+    expect(list[0].content).toBe("内容可见");
+  });
+
+  it("获取单个隐藏备忘录", async () => {
+    const m = await createHidden("single", "body");
+    const res = await hiddenAuthFetch(`/api/hidden-memos/${m.id}`);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.title).toBe("single");
+  });
+
+  it("更新隐藏备忘录", async () => {
+    const m = await createHidden("旧", "x");
+    const res = await hiddenAuthFetch(`/api/hidden-memos/${m.id}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "新", content: "y" }),
+    });
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.title).toBe("新");
+    expect(data.content).toBe("y");
+    const list = await (await hiddenAuthFetch("/api/memos?view=hidden")).json();
+    expect(list.length).toBe(1);
+    expect(list[0].title).toBe("新");
+  });
+
+  it("删除隐藏备忘录", async () => {
+    const m = await createHidden("删除", "x");
+    const del = await hiddenAuthFetch(`/api/hidden-memos/${m.id}`, { method: "DELETE" });
+    expect(del.status).toBe(200);
+    const list = await (await hiddenAuthFetch("/api/memos?view=hidden")).json();
+    expect(list.length).toBe(0);
+  });
+
+  it("普通接口无法读写隐藏备忘录", async () => {
+    const m = await createHidden("隔离", "x");
+    const get = await authedFetch(`/api/memos/${m.id}`);
+    expect(get.status).toBe(404);
+    const del = await authedFetch(`/api/memos/${m.id}`, { method: "DELETE" });
+    expect(del.status).toBe(404);
+  });
+
+  it("篡改密文后返回 500", async () => {
+    const m = await createHidden("tamper", "x");
+    const raw = await env.MEMOS_KV.get("sc:" + m.id);
+    await env.MEMOS_KV.put("sc:" + m.id, raw.slice(0, -4) + "AAAA");
+    const res = await hiddenAuthFetch(`/api/hidden-memos/${m.id}`);
+    expect(res.status).toBe(500);
+  });
+
+  it("应用页面包含「隐藏」侧边栏入口", async () => {
+    const res = await authedFetch("/");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-folder="hidden"');
+    expect(html).toContain("隐藏");
+  });
+
+  it("无隐藏授权时无法将普通备忘录隐藏（403）", async () => {
+    const created = await (await authedFetch("/api/memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "H0", content: "x" }),
+    })).json();
+    const res = await authedFetch(`/api/memos/${created.id}/hidden`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hidden: true }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("将普通备忘录隐藏后移出普通列表并保留分类", async () => {
+    const folder = await (await authedFetch("/api/folders", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "工作" }),
+    })).json();
+    const created = await (await authedFetch("/api/memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "H1", content: "hidden body", folderIds: [folder.id] }),
+    })).json();
+    const res = await hiddenAuthFetch(`/api/memos/${created.id}/hidden`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hidden: true }),
+    });
+    expect(res.status).toBe(200);
+    const memos = await (await authedFetch("/api/memos")).json();
+    expect(memos.length).toBe(0);
+    const hidden = await (await hiddenAuthFetch("/api/memos?view=hidden")).json();
+    expect(hidden.length).toBe(1);
+    expect(hidden[0].title).toBe("H1");
+    expect(hidden[0].folderIds).toEqual([folder.id]);
+  });
+
+  it("隐藏后分享令牌被清除，分享链接失效", async () => {
+    const created = await (await authedFetch("/api/memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "share", content: "x" }),
+    })).json();
+    const share = await (await authedFetch(`/api/memos/${created.id}/share`, { method: "POST" })).json();
+    await hiddenAuthFetch(`/api/memos/${created.id}/hidden`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hidden: true }),
+    });
+    const hidden = await (await hiddenAuthFetch("/api/memos?view=hidden")).json();
+    expect(hidden[0].shareToken).toBeUndefined();
+    const page = await SELF.fetch(`${BASE}/share/${share.shareToken}`);
+    expect(page.status).toBe(404);
+  });
+
+  it("取消隐藏后恢复正常列表并保留分类", async () => {
+    const folder = await (await authedFetch("/api/folders", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "工作" }),
+    })).json();
+    const created = await (await authedFetch("/api/memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "U", content: "x", folderIds: [folder.id] }),
+    })).json();
+    await hiddenAuthFetch(`/api/memos/${created.id}/hidden`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hidden: true }),
+    });
+    const res2 = await hiddenAuthFetch(`/api/memos/${created.id}/hidden`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hidden: false }),
+    });
+    expect(res2.status).toBe(200);
+    const memos = await (await authedFetch("/api/memos")).json();
+    expect(memos.length).toBe(1);
+    expect(memos[0].title).toBe("U");
+    expect(memos[0].folderIds).toEqual([folder.id]);
+    const hidden = await (await hiddenAuthFetch("/api/memos?view=hidden")).json();
+    expect(hidden.length).toBe(0);
+  });
+
+  it("取消隐藏后旧分享链接不会复活，分享持久失效", async () => {
+    const created = await (await authedFetch("/api/memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "revive", content: "x" }),
+    })).json();
+    const share = await (await authedFetch(`/api/memos/${created.id}/share`, { method: "POST" })).json();
+    await hiddenAuthFetch(`/api/memos/${created.id}/hidden`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hidden: true }),
+    });
+    await hiddenAuthFetch(`/api/memos/${created.id}/hidden`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hidden: false }),
+    });
+    const page = await SELF.fetch(`${BASE}/share/${share.shareToken}`);
+    expect(page.status).toBe(404);
+  });
+
+  it("未登录直接调用隐藏授权接口被拒绝", async () => {
+    const res = await SELF.fetch(`${BASE}/api/hidden-auth`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: "hidden2026" }),
+    });
+    expect(res.status).toBe(401);
   });
 });

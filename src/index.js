@@ -63,6 +63,50 @@ function constantTimeEqual(a, b) {
   return diff === 0;
 }
 
+// ── 隐藏备忘录 AES-GCM 加解密 ──────────────────────────────────
+function bytesToBase64(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+async function getEncKey(env) {
+  const raw = env.MEMO_ENCRYPT_KEY;
+  if (!raw) return null;
+  return crypto.subtle.importKey('raw', base64ToBytes(raw), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+
+// 加密整个对象为字符串，格式: base64(iv).base64(ciphertext)
+async function encryptJson(obj, env) {
+  const key = await getEncKey(env);
+  if (!key) throw new Error('missing MEMO_ENCRYPT_KEY');
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plain = new TextEncoder().encode(JSON.stringify(obj));
+  const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain);
+  return bytesToBase64(iv) + '.' + bytesToBase64(new Uint8Array(cipher));
+}
+
+// 解密字符串为对象，非法/篡改密文抛错
+async function decryptJson(raw, env) {
+  const key = await getEncKey(env);
+  if (!key) throw new Error('missing MEMO_ENCRYPT_KEY');
+  const sep = raw.indexOf('.');
+  if (sep === -1) throw new Error('bad cipher');
+  const iv = base64ToBytes(raw.slice(0, sep));
+  const cipher = base64ToBytes(raw.slice(sep + 1));
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipher);
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
 async function createSessionToken(username, secret) {
   const payload = username + ':' + Date.now();
   const sig = await hmacSha256(payload, secret);
@@ -84,11 +128,33 @@ async function verifySessionToken(token, secret) {
   const username = parts[0];
   const timestamp = parseInt(parts[1], 10);
   // 会话有效期 24 小时
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
   if (Date.now() - timestamp > 24 * 60 * 60 * 1000) return null;
   // 验证用户名格式
   if (typeof username !== 'string' || username.length === 0 || username.length > 64) return null;
   if (!/^[a-zA-Z0-9_\-]+$/.test(username)) return null;
   return { username };
+}
+
+// 隐藏会话令牌: hidden:<timestamp>:<sig>，有效期 30 分钟
+async function createHiddenToken(secret) {
+  const payload = 'hidden:' + Date.now();
+  const sig = await hmacSha256(payload, secret);
+  return payload + ':' + sig;
+}
+
+async function verifyHiddenToken(token, secret) {
+  if (typeof token !== 'string' || token.length > 500) return false;
+  const lastColon = token.lastIndexOf(':');
+  if (lastColon === -1) return false;
+  const payload = token.slice(0, lastColon);
+  const expectedSig = token.slice(lastColon + 1);
+  if (!constantTimeEqual(expectedSig, await hmacSha256(payload, secret))) return false;
+  const parts = payload.split(':');
+  if (parts.length !== 2 || parts[0] !== 'hidden') return false;
+  const timestamp = parseInt(parts[1], 10);
+  if (isNaN(timestamp) || Date.now() - timestamp > 30 * 60 * 1000) return false;
+  return true;
 }
 
 // ── KV 数据格式 ─────────────────────────────────────────────────
@@ -145,10 +211,34 @@ async function handleRequest(request, env) {
       if (path === '/api/login' && method === 'POST') {
         return handleLogin(request, env);
       }
-      
+      if (path === '/api/hidden-logout' && method === 'POST') {
+        return handleHiddenLogout();
+      }
+
       // 其他 API 需要认证
       if (!user) {
         return json({ error: 'Unauthorized' }, 401);
+      }
+
+      // 隐藏密码授权必须先登录，否则未认证 IP 可直接爆破隐藏密码
+      if (path === '/api/hidden-auth' && method === 'POST') {
+        return handleHiddenAuth(request, env);
+      }
+
+      // 隐藏备忘录区域需已配置 HIDDEN_PASSWORD、MEMO_ENCRYPT_KEY，并持有有效隐藏会话
+      const isHiddenPath = path === '/api/hidden-memos' || path.startsWith('/api/hidden-memos/') ||
+        (path === '/api/memos' && method === 'GET' && url.searchParams.get('view') === 'hidden') ||
+        (path.startsWith('/api/memos/') && path.endsWith('/hidden'));
+      if (isHiddenPath) {
+        if (!env.HIDDEN_PASSWORD) {
+          return json({ error: 'Hidden memo password not configured' }, 500, { 'Cache-Control': 'no-store' });
+        }
+        if (!env.MEMO_ENCRYPT_KEY) {
+          return json({ error: 'Encryption unavailable', detail: 'MEMO_ENCRYPT_KEY not configured' }, 500, { 'Cache-Control': 'no-store' });
+        }
+        if (!(await verifyHiddenToken(cookies['cf_memo_hidden'], env.SESSION_SECRET))) {
+          return json({ error: 'Hidden auth required' }, 403, { 'Cache-Control': 'no-store' });
+        }
       }
 
       if (path === '/api/folders') {
@@ -185,9 +275,30 @@ async function handleRequest(request, env) {
         if (method === 'DELETE') return handleUnshareMemo(memoId, env);
       }
 
+      if (path.startsWith('/api/memos/') && path.endsWith('/hidden')) {
+        const memoId = path.slice('/api/memos/'.length, -'/hidden'.length);
+        if (!memoId) return json({ error: 'Missing memo id' }, 400);
+        if (method === 'PUT') return handleSetHiddenMemo(request, memoId, env);
+      }
+
       if (path === '/api/memos') {
-        if (method === 'GET') return handleListMemos(user, env);
+        if (method === 'GET') {
+          const url = new URL(request.url);
+          if (url.searchParams.get('view') === 'hidden') return handleListHiddenMemos(env);
+          return handleListMemos(user, env);
+        }
         if (method === 'POST') return handleCreateMemo(request, env);
+      }
+
+      if (path === '/api/hidden-memos' && method === 'POST') {
+        return handleCreateHiddenMemo(request, env);
+      }
+      if (path.startsWith('/api/hidden-memos/')) {
+        const memoId = path.slice('/api/hidden-memos/'.length);
+        if (!memoId) return json({ error: 'Missing memo id' }, 400);
+        if (method === 'GET') return handleGetHiddenMemo(memoId, env);
+        if (method === 'PUT') return handleUpdateHiddenMemo(request, memoId, env);
+        if (method === 'DELETE') return handleDeleteHiddenMemo(memoId, env);
       }
       
       if (path.startsWith('/api/memos/')) {
@@ -337,7 +448,7 @@ async function handleListMemos(user, env) {
   } while (cursor);
   // 按更新时间倒序
   memos.sort((a, b) => b.updatedAt - a.updatedAt);
-  return json(memos, 200, { 'Cache-Control': 'public, max-age=2, s-maxage=5' });
+  return json(memos, 200, { 'Cache-Control': 'private, max-age=2, s-maxage=0' });
 }
 
 async function handleCreateMemo(request, env) {
@@ -481,6 +592,127 @@ async function handleGetMemo(memoId, env) {
   }
 }
 
+// ── 隐藏备忘录 CRUD ──────────────────────────────────────────────
+async function handleListHiddenMemos(env) {
+  const memos = [];
+  let cursor;
+  do {
+    const list = await env.MEMOS_KV.list({ prefix: 'sc:', cursor: cursor, limit: 1000 });
+    const raws = await Promise.all(list.keys.map(k => env.MEMOS_KV.get(k.name)));
+    for (const raw of raws) {
+      if (raw) {
+        try {
+          const m = await decryptJson(raw, env);
+          // 旧版本隐藏数据可能没有 folderIds 字段，统一默认空数组供前端渲染文件夹徽标
+          if (!m.folderIds) m.folderIds = [];
+          memos.push(m);
+        } catch { /* 忽略解密失败/损坏数据 */ }
+      }
+    }
+    cursor = list.list_complete ? undefined : list.cursor;
+  } while (cursor);
+  memos.sort((a, b) => b.updatedAt - a.updatedAt);
+  return json(memos, 200, { 'Cache-Control': 'no-store' });
+}
+
+async function handleCreateHiddenMemo(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'Invalid JSON' }, 400);
+  }
+  const { title, content } = body;
+  if (title !== undefined && typeof title !== 'string') {
+    return json({ error: 'Title must be a string' }, 400);
+  }
+  if (content !== undefined && typeof content !== 'string') {
+    return json({ error: 'Content must be a string' }, 400);
+  }
+  if (!title && !content) {
+    return json({ error: 'Title or content is required' }, 400);
+  }
+  if (title && title.length > 500) {
+    return json({ error: 'Title must be 500 characters or less' }, 400);
+  }
+  if (content && content.length > 20000) {
+    return json({ error: 'Content must be 20000 characters or less' }, 400);
+  }
+  const now = Date.now();
+  const memo = { id: genId(), title: (title || '').trim(), content: (content || '').trim(), createdAt: now, updatedAt: now, hidden: true, folderIds: [] };
+  try {
+    await env.MEMOS_KV.put('sc:' + memo.id, await encryptJson(memo, env));
+  } catch {
+    return json({ error: 'Encryption unavailable' }, 500, { 'Cache-Control': 'no-store' });
+  }
+  return json(memo, 201, { 'Cache-Control': 'no-store' });
+}
+
+async function handleGetHiddenMemo(memoId, env) {
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(memoId)) {
+    return json({ error: 'Invalid memo id' }, 400);
+  }
+  const raw = await env.MEMOS_KV.get('sc:' + memoId);
+  if (!raw) return json({ error: 'Memo not found' }, 404);
+  try {
+    const m = await decryptJson(raw, env);
+    if (!m.folderIds) m.folderIds = [];
+    return json(m, 200, { 'Cache-Control': 'no-store' });
+  } catch {
+    return json({ error: 'Memo data corrupted' }, 500, { 'Cache-Control': 'no-store' });
+  }
+}
+
+async function handleUpdateHiddenMemo(request, memoId, env) {
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(memoId)) {
+    return json({ error: 'Invalid memo id' }, 400);
+  }
+  const raw = await env.MEMOS_KV.get('sc:' + memoId);
+  if (!raw) return json({ error: 'Memo not found' }, 404);
+  let old;
+  try {
+    old = await decryptJson(raw, env);
+  } catch {
+    return json({ error: 'Memo data corrupted' }, 500, { 'Cache-Control': 'no-store' });
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'Invalid JSON' }, 400);
+  }
+  if (body.title !== undefined && typeof body.title !== 'string') {
+    return json({ error: 'Title must be a string' }, 400);
+  }
+  if (body.content !== undefined && typeof body.content !== 'string') {
+    return json({ error: 'Content must be a string' }, 400);
+  }
+  if (body.title !== undefined && body.title.length > 500) {
+    return json({ error: 'Title must be 500 characters or less' }, 400);
+  }
+  if (body.content !== undefined && body.content.length > 20000) {
+    return json({ error: 'Content must be 20000 characters or less' }, 400);
+  }
+  const updated = { ...old, title: body.title !== undefined ? body.title.trim() : old.title, content: body.content !== undefined ? body.content.trim() : old.content, updatedAt: Date.now() };
+  if (!updated.folderIds) updated.folderIds = [];
+  try {
+    await env.MEMOS_KV.put('sc:' + memoId, await encryptJson(updated, env));
+  } catch {
+    return json({ error: 'Encryption unavailable' }, 500, { 'Cache-Control': 'no-store' });
+  }
+  return json(updated, 200, { 'Cache-Control': 'no-store' });
+}
+
+async function handleDeleteHiddenMemo(memoId, env) {
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(memoId)) {
+    return json({ error: 'Invalid memo id' }, 400);
+  }
+  const existing = await env.MEMOS_KV.get('sc:' + memoId);
+  if (!existing) return json({ error: 'Memo not found' }, 404);
+  await env.MEMOS_KV.delete('sc:' + memoId);
+  return json({ ok: true }, 200, { 'Cache-Control': 'no-store' });
+}
+
 // ── 分享 ──────────────────────────────────────────────────────────
 async function handleShareMemo(memoId, env) {
   if (!/^[a-zA-Z0-9_-]{1,40}$/.test(memoId)) {
@@ -534,6 +766,121 @@ async function handleStarMemo(memoId, env) {
   return json(memo);
 }
 
+async function handleHiddenAuth(request, env) {
+  if (!request.headers.get('Content-Type')?.includes('application/json')) {
+    return json({ error: 'Content-Type must be application/json' }, 415);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'Invalid JSON' }, 400);
+  }
+  const { password } = body;
+  if (typeof password !== 'string' || !password) {
+    return json({ error: 'Password is required' }, 400);
+  }
+  if (password.length > 128) {
+    return json({ error: 'Invalid password' }, 401);
+  }
+  // 隐藏密码尝试速率限制 - 基于客户端 IP
+  const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const rateLimitKey = 'ratelimit:hidden:' + clientIP;
+  let attempts = 0;
+  try {
+    const rawAttempts = await env.MEMOS_KV.get(rateLimitKey);
+    if (rawAttempts) attempts = parseInt(rawAttempts, 10);
+  } catch { /* 获取失败时允许继续 */ }
+  if (attempts >= 5) {
+    return json({ error: 'Too many attempts. Please try again later.' }, 429);
+  }
+  if (!constantTimeEqual(password, (env.HIDDEN_PASSWORD || '').trim())) {
+    try {
+      await env.MEMOS_KV.put(rateLimitKey, String(attempts + 1), { expirationTtl: 900 });
+    } catch { /* 忽略存储错误 */ }
+    return json({ error: 'Invalid password' }, 401);
+  }
+  try {
+    await env.MEMOS_KV.delete(rateLimitKey);
+  } catch { /* 忽略 */ }
+  const token = await createHiddenToken(env.SESSION_SECRET);
+  const secure = isSecureRequest(request);
+  const cookie = serializeCookie('cf_memo_hidden', token, {
+    httpOnly: true,
+    secure: secure,
+    sameSite: 'Lax',
+    maxAge: 30 * 60, // 30 分钟
+    path: '/',
+  });
+  return json({ ok: true }, 200, {
+    'Set-Cookie': cookie,
+    'Cache-Control': 'no-store',
+  });
+}
+
+function handleHiddenLogout(request) {
+  const secure = isSecureRequest(request);
+  const cookie = serializeCookie('cf_memo_hidden', '', {
+    httpOnly: true,
+    secure: secure,
+    sameSite: 'Lax',
+    maxAge: 0,
+    path: '/',
+  });
+  return json({ ok: true }, 200, {
+    'Set-Cookie': cookie,
+    'Cache-Control': 'no-store',
+  });
+}
+
+// 隐藏/取消隐藏：memo:<id> <-> sc:<id>，保留 folderIds/starred，隐藏时移除分享令牌使分享立即失效
+async function handleSetHiddenMemo(request, memoId, env) {
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(memoId)) {
+    return json({ error: 'Invalid memo id' }, 400);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'Invalid JSON' }, 400);
+  }
+  if (typeof body.hidden !== 'boolean') {
+    return json({ error: 'hidden must be a boolean' }, 400);
+  }
+  if (body.hidden) {
+    const raw = await env.MEMOS_KV.get('memo:' + memoId);
+    if (!raw) return json({ error: 'Memo not found' }, 404);
+    let memo;
+    try { memo = JSON.parse(raw); } catch { return json({ error: 'Memo data corrupted' }, 500); }
+    // 隐藏时一并删除分享映射，避免取消隐藏后旧分享链接复活泄露内容
+    if (memo.shareToken) {
+      await env.MEMOS_KV.delete('share:' + memo.shareToken);
+    }
+    delete memo.shareToken;
+    memo.updatedAt = Date.now();
+    try {
+      await env.MEMOS_KV.put('sc:' + memoId, await encryptJson(memo, env));
+    } catch {
+      return json({ error: 'Encryption unavailable' }, 500, { 'Cache-Control': 'no-store' });
+    }
+    await env.MEMOS_KV.delete('memo:' + memoId);
+    return json(memo, 200, { 'Cache-Control': 'no-store' });
+  }
+  const raw = await env.MEMOS_KV.get('sc:' + memoId);
+  if (!raw) return json({ error: 'Memo not found' }, 404);
+  let memo;
+  try {
+    memo = await decryptJson(raw, env);
+  } catch {
+    return json({ error: 'Memo data corrupted' }, 500, { 'Cache-Control': 'no-store' });
+  }
+  delete memo.shareToken;
+  memo.updatedAt = Date.now();
+  await env.MEMOS_KV.put('memo:' + memoId, JSON.stringify(memo));
+  await env.MEMOS_KV.delete('sc:' + memoId);
+  return json(memo, 200, { 'Cache-Control': 'no-store' });
+}
+
 function serveSharePage(token, env) {
   return env.MEMOS_KV.get('share:' + token).then(function(memoId) {
     if (!memoId) {
@@ -546,6 +893,10 @@ function serveSharePage(token, env) {
       var memo;
       try { memo = JSON.parse(raw); } catch {
         return new Response('内容加载失败', { status: 500, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
+      }
+      // 校验 memo 自身 shareToken，兜底 KV 读缓存陈旧窗口：隐藏/取消分享后旧链接立即失效
+      if (!memo.shareToken || memo.shareToken !== token) {
+        return new Response('分享不存在或已失效', { status: 404, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
       }
       var title = memo.title || '备忘录';
       var safeTitle = title.replace(/</g, '&lt;');
@@ -583,7 +934,7 @@ async function handleListFolders(env) {
     cursor = list.list_complete ? undefined : list.cursor;
   } while (cursor);
   folders.sort((a, b) => a.createdAt - b.createdAt);
-  return json(folders, 200, { 'Cache-Control': 'public, max-age=2, s-maxage=5' });
+  return json(folders, 200, { 'Cache-Control': 'private, max-age=2, s-maxage=0' });
 }
 
 async function handleCreateFolder(request, env) {
@@ -659,6 +1010,32 @@ async function handleDeleteFolder(folderId, env) {
     await Promise.all(updates);
     cursor = list.list_complete ? undefined : list.cursor;
   } while (cursor);
+
+  // 同步清除隐藏备忘录中的该分类归属
+  let hcursor;
+  do {
+    const hlist = await env.MEMOS_KV.list({ prefix: 'sc:', cursor: hcursor, limit: 1000 });
+    const hraws = await Promise.all(hlist.keys.map(k => env.MEMOS_KV.get(k.name)));
+    const hupdates = [];
+    for (let i = 0; i < hlist.keys.length; i++) {
+      const raw = hraws[i];
+      if (raw) {
+        try {
+          const memo = await decryptJson(raw, env);
+          const hfids = memo.folderIds || [];
+          const hidx = hfids.indexOf(folderId);
+          if (hidx !== -1) {
+            hfids.splice(hidx, 1);
+            if (hfids.length) { memo.folderIds = hfids; } else { delete memo.folderIds; }
+            memo.updatedAt = Date.now();
+            hupdates.push(env.MEMOS_KV.put(hlist.keys[i].name, encryptJson(memo, env)));
+          }
+        } catch { /* 忽略损坏/解密失败数据 */ }
+      }
+    }
+    await Promise.all(hupdates);
+    hcursor = hlist.list_complete ? undefined : hlist.cursor;
+  } while (hcursor);
   return json({ ok: true });
 }
 
@@ -1061,6 +1438,10 @@ function serveAppPage() {
     h.push('      <span class="folder-icon">🔗</span>');
     h.push('      <span class="folder-name">已分享</span>');
     h.push('    </div>');
+  h.push('    <div class="folder-item" data-folder="hidden">');
+  h.push('      <span class="folder-icon">🔒</span>');
+  h.push('      <span class="folder-name">隐藏</span>');
+  h.push('    </div>');
   h.push('    <div id="folderList"></div>');
   h.push('  </div>');
   h.push('  <div class="main-content">');
@@ -1128,11 +1509,26 @@ function serveAppPage() {
   h.push('  </div>');
   h.push('</div>');
   h.push('');
+  h.push('<div class="modal-overlay hidden-modal" id="hiddenModal">');
+  h.push('  <div class="modal">');
+  h.push('    <h2>进入隐藏备忘录</h2>');
+  h.push('    <div class="field">');
+  h.push('      <label for="hiddenPassInput">隐藏密码</label>');
+  h.push('      <input id="hiddenPassInput" type="password" placeholder="输入隐藏密码" maxlength="128" autocomplete="off">');
+  h.push('    </div>');
+  h.push('    <div class="modal-btns">');
+  h.push('      <button class="btn-cancel" id="hiddenCancelBtn">取消</button>');
+  h.push('      <button class="btn-save" id="hiddenAuthBtn">确认</button>');
+  h.push('    </div>');
+  h.push('  </div>');
+  h.push('</div>');
+  h.push('');
   h.push('<script>');
   h.push('(function(){');
   h.push('// ── 初始化 ───');
   h.push('var currentUser = "";');
   h.push('var memosCache = [];');
+  h.push('var hiddenMemosCache = [];');
   h.push('var foldersCache = [];');
   h.push('var currentFolder = "all";');
   h.push('var searchQuery = "";');
@@ -1218,11 +1614,33 @@ function serveAppPage() {
   h.push('  }');
   h.push('}');
 h.push('');
+  h.push('async function loadHiddenMemos() {');
+  h.push('  isLoading = true;');
+  h.push('  renderMemoList();');
+  h.push('  try {');
+  h.push('    var res = await fetch("/api/memos?view=hidden");');
+  h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
+  h.push('    if (res.status === 403) {');
+  h.push('      isLoading = false;');
+  h.push('      showHiddenPasswordModal(loadHiddenMemos);');
+  h.push('      return;');
+  h.push('    }');
+  h.push('    hiddenMemosCache = await res.json();');
+  h.push('    isLoading = false;');
+  h.push('    renderMemoList();');
+  h.push('  } catch(e) {');
+  h.push('    isLoading = false;');
+  h.push('    document.getElementById("memoList").innerHTML = "<div class=\\"empty\\"><span class=\\"empty-icon\\">😵</span>加载失败，请刷新页面</div>";');
+  h.push('  }');
+  h.push('}');
+h.push('');
   h.push('function renderMemoList() {');
   h.push('  var container = document.getElementById("memoList");');
   h.push('  var q = searchQuery.trim().toLowerCase();');
   h.push('  var filtered = memosCache;');
-  h.push('  if (currentFolder === "starred") {');
+  h.push('  if (currentFolder === "hidden") {');
+  h.push('    filtered = hiddenMemosCache;');
+  h.push('  } else if (currentFolder === "starred") {');
   h.push('    filtered = memosCache.filter(function(m) { return m.starred; });');
   h.push('  } else if (currentFolder === "none") {');
   h.push('    filtered = memosCache.filter(function(m) { return !m.folderIds || !m.folderIds.length; });');
@@ -1239,18 +1657,19 @@ h.push('');
   h.push('    return;');
   h.push('  }');
   h.push('  if (filtered.length === 0) {');
-  h.push('    var emptyMsg = currentFolder === "starred" ? "还没有星标备忘录，点击卡片上的 ⭐ 星标" : currentFolder === "shared" ? "还没有已分享的备忘录" : currentFolder === "none" ? "所有备忘录都已分类" : q ? "没有匹配的备忘录" : "还没有备忘录，点击右上角「新建」开始";');
+  h.push('    var emptyMsg = currentFolder === "starred" ? "还没有星标备忘录，点击卡片上的 ⭐ 星标" : currentFolder === "shared" ? "还没有已分享的备忘录" : currentFolder === "hidden" ? "还没有隐藏备忘录，点击右上角「新建」加密保存" : currentFolder === "none" ? "所有备忘录都已分类" : q ? "没有匹配的备忘录" : "还没有备忘录，点击右上角「新建」开始";');
   h.push('    container.innerHTML = "<div class=\\"empty\\"><span class=\\"empty-icon\\">📝</span>" + emptyMsg + "</div>";');
   h.push('    return;');
   h.push('  }');
   h.push('  container.innerHTML = filtered.map(function(m) {');
   h.push('    var date = new Date(m.updatedAt).toLocaleString("zh-CN");');
+  h.push('    var isHidden = currentFolder === "hidden";');
   h.push('    var shareCls = m.shareToken ? " shared" : "";');
   h.push('    var starCls = m.starred ? " starred" : "";');
     h.push('    var cardCls = "memo-card" + (m.shareToken ? " shared-card" : "") + (m.starred ? " starred-card" : "");');
   h.push('    var card = "<div class=\\"" + cardCls + "\\" data-memo-id=\\"" + m.id + "\\">";');
-  h.push('    card += "<label class=\\"batch-checkbox\\"><input type=\\"checkbox\\" data-batch=\\"" + m.id + "\\"></label>";');
-  h.push('    card += "<span class=\\"drag-handle\\" draggable=\\"true\\" title=\\"拖拽移动\\">⠿</span>";');
+  h.push('    if (!isHidden) card += "<label class=\\"batch-checkbox\\"><input type=\\"checkbox\\" data-batch=\\"" + m.id + "\\"></label>";');
+  h.push('    if (!isHidden) card += "<span class=\\"drag-handle\\" draggable=\\"true\\" title=\\"拖拽移动\\">⠿</span>";');
     h.push('    var folderNames = "";');
   h.push('    var fids = m.folderIds || [];');
   h.push('    if (fids.length) {');
@@ -1267,9 +1686,11 @@ h.push('');
   h.push('    }');
   h.push('    card += "<div class=\\"time\\">更新于 " + date + "</div>";');
   h.push('    card += "<div class=\\"card-actions\\">";');
-    h.push('    card += "<button class=\\"star-btn" + starCls + "\\" title=\\"星标\\" data-star=\\"" + m.id + "\\">" + (m.starred ? "\u2B50" : "\u2606") + "</button>";');
+  h.push('    if (isHidden) card += "<button title=\\"取消隐藏\\" data-hidden=\\"" + m.id + "\\" data-hide=\\"false\\">\uD83D\uDC41\uFE0F</button>";');
+  h.push('    else card += "<button title=\\"隐藏\\" data-hidden=\\"" + m.id + "\\" data-hide=\\"true\\">\uD83D\uDD12</button>";');
+    h.push('    if (!isHidden) card += "<button class=\\"star-btn" + starCls + "\\" title=\\"星标\\" data-star=\\"" + m.id + "\\">" + (m.starred ? "\u2B50" : "\u2606") + "</button>";');
   h.push('    card += "<button title=\\"编辑\\" data-edit=\\"" + m.id + "\\">\u270F\uFE0F</button>";');
-    h.push('    card += "<button class=\\"share-btn" + shareCls + "\\" title=\\"分享\\" data-share=\\"" + m.id + "\\">\uD83D\uDD17</button>";');
+    h.push('    if (!isHidden) card += "<button class=\\"share-btn" + shareCls + "\\" title=\\"分享\\" data-share=\\"" + m.id + "\\">\uD83D\uDD17</button>";');
     h.push('    card += "<button title=\\"复制\\" data-copy=\\"" + m.id + "\\">\uD83D\uDCCB</button>";');
     h.push('    card += "<button title=\\"删除\\" data-delete=\\"" + m.id + "\\">\uD83D\uDDD1\uFE0F</button>";');
   h.push('    card += "</div>";');
@@ -1291,6 +1712,9 @@ h.push('');
   h.push('  container.querySelectorAll("[data-copy]").forEach(function(btn) {');
   h.push('    btn.addEventListener("click", function() { copyMemoContent(btn.dataset.copy); });');
   h.push('  });');
+  h.push('  container.querySelectorAll("[data-hidden]").forEach(function(btn) {');
+  h.push('    btn.addEventListener("click", function() { toggleHidden(btn.dataset.hidden, btn.dataset.hide === "true"); });');
+  h.push('  });');
   h.push('  // 拖拽支持');
   h.push('  container.querySelectorAll(".drag-handle[draggable]").forEach(function(handle) {');
   h.push('    handle.addEventListener("dragstart", function(e) {');
@@ -1304,24 +1728,10 @@ h.push('');
   h.push('      if (card) card.classList.remove("dragging");');
   h.push('    });');
   h.push('  });');
-  h.push('  // 未分类（sidebar空白）作为拖拽目标');
-  h.push('  var sidebar = document.getElementById("folderSidebar");');
-  h.push('  sidebar.addEventListener("dragover", function(e) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; sidebar.classList.add("drag-over"); });');
-  h.push('  sidebar.addEventListener("dragleave", function(e) {');
-  h.push('    if (!sidebar.contains(e.relatedTarget)) sidebar.classList.remove("drag-over");');
-  h.push('  });');
-  h.push('  sidebar.addEventListener("drop", function(e) {');
-  h.push('    e.preventDefault();');
-  h.push('    sidebar.classList.remove("drag-over");');
-  h.push('    var memoId = e.dataTransfer.getData("text/memo-id");');
-  h.push('    var target = e.target.closest("[data-folder]");');
-  h.push('    if (target) return; // 由 folder-item 处理');
-  h.push('    if (memoId) moveMemoToFolder(memoId, null);');
-  h.push('  });');
   h.push('  updateFolderCounts();');
   h.push('}');
-h.push('');
-h.push('function escapeHtml(text) {');
+  h.push('');
+  h.push('function escapeHtml(text) {');
   h.push('  var div = document.createElement("div");');
   h.push('  div.textContent = text;');
   h.push('  return div.innerHTML;');
@@ -1366,12 +1776,12 @@ h.push('function escapeHtml(text) {');
   h.push('});');
   h.push('');
   h.push('function openNewModal() {');
-  h.push('  modalTitle.textContent = "新建备忘录";');
+  h.push('  modalTitle.textContent = currentFolder === "hidden" ? "新建隐藏备忘录" : "新建备忘录";');
   h.push('  editMemoId.value = "";');
   h.push('  memoTitle.value = "";');
   h.push('  memoContent.value = "";');
-  h.push('  updateFolderCheckboxes();');
-  h.push('  if (currentFolder !== "all" && currentFolder !== "none" && currentFolder !== "starred" && currentFolder !== "shared") {');
+  h.push('  setEditorFolderField(currentFolder === "hidden");');
+  h.push('  if (currentFolder !== "all" && currentFolder !== "none" && currentFolder !== "starred" && currentFolder !== "shared" && currentFolder !== "hidden") {');
   h.push('    var chip = document.querySelector("#memoFolders .folder-chip[data-fid=\\"" + currentFolder + "\\"]");');
   h.push('    if (chip) chip.classList.add("selected");');
   h.push('  }');
@@ -1386,30 +1796,32 @@ h.push('function escapeHtml(text) {');
   h.push('}');
   h.push('');
   h.push('async function openEditModal(id) {');
-  h.push('  modalTitle.textContent = "编辑备忘录";');
+  h.push('  modalTitle.textContent = currentFolder === "hidden" ? "编辑隐藏备忘录" : "编辑备忘录";');
   h.push('  editMemoId.value = id;');
   h.push('  deleteBtn.style.display = "inline-block";');
-  h.push('  var memos = memosCache;');
+  h.push('  var isHidden = currentFolder === "hidden";');
+  h.push('  var reloadFn = isHidden ? loadHiddenMemos : loadMemos;');
+  h.push('  var memos = isHidden ? hiddenMemosCache : memosCache;');
   h.push('  if (memos.length === 0) {');
   h.push('    try {');
-  h.push('      var res = await fetch("/api/memos");');
+  h.push('      var res = await fetch(isHidden ? "/api/memos?view=hidden" : "/api/memos");');
   h.push('      if (res.status === 401) { window.location.href = "/"; return; }');
-  h.push('      if (res.ok) { memos = await res.json(); memosCache = memos; }');
-  h.push('      else { toast("加载失败，请重试"); closeModal(); loadMemos(); return; }');
-  h.push('    } catch(e) { toast("网络错误，请重试"); closeModal(); loadMemos(); return; }');
+  h.push('      if (res.ok) { memos = await res.json(); if (isHidden) hiddenMemosCache = memos; else memosCache = memos; }');
+  h.push('      else { toast("加载失败，请重试"); closeModal(); reloadFn(); return; }');
+  h.push('    } catch(e) { toast("网络错误，请重试"); closeModal(); reloadFn(); return; }');
   h.push('  }');
   h.push('  var memo = memos.find(function(m) { return m.id === id; });');
   h.push('  if (memo) {');
   h.push('    memoTitle.value = memo.title;');
   h.push('    memoContent.value = memo.content;');
-  h.push('    updateFolderCheckboxes();');
+  h.push('    setEditorFolderField(isHidden);');
   h.push('    var fids = memo.folderIds || [];');
   h.push('    fids.forEach(function(fid) {');
   h.push('      var chip = document.querySelector("#memoFolders .folder-chip[data-fid=\\"" + fid + "\\"]");');
   h.push('      if (chip) chip.classList.add("selected");');
   h.push('    });');
   h.push('    var shareField = document.querySelector(".share-field");');
-  h.push('    if (shareField) {');
+  h.push('    if (shareField && !isHidden) {');
   h.push('      shareField.style.display = "block";');
   h.push('      var shareToggle = document.getElementById("shareToggle");');
   h.push('      var shareUrl = document.getElementById("shareUrl");');
@@ -1426,7 +1838,7 @@ h.push('function escapeHtml(text) {');
   h.push('  } else {');
   h.push('    toast("该备忘录不存在或已被删除");');
   h.push('    closeModal();');
-  h.push('    loadMemos();');
+  h.push('    reloadFn();');
   h.push('    return;');
   h.push('  }');
   h.push('  document.body.classList.add("modal-open");');
@@ -1456,34 +1868,39 @@ h.push('function escapeHtml(text) {');
   h.push('  saveBtn.disabled = true;');
   h.push('  saveBtn.textContent = "保存中...";');
   h.push('  try {');
+  h.push('    var isHidden = currentFolder === "hidden";');
+  h.push('    var base = isHidden ? "/api/hidden-memos" : "/api/memos";');
+  h.push('    var body = { title: title, content: content };');
+  h.push('    if (!isHidden) body.folderIds = getSelectedFolders();');
   h.push('    var res;');
   h.push('    if (id) {');
-  h.push('      res = await fetch("/api/memos/" + id, {');
+  h.push('      res = await fetch(base + "/" + id, {');
   h.push('        method: "PUT",');
   h.push('        headers: { "Content-Type": "application/json" },');
-  h.push('        body: JSON.stringify({ title: title, content: content, folderIds: getSelectedFolders() })');
+  h.push('        body: JSON.stringify(body)');
   h.push('      });');
   h.push('    } else {');
-  h.push('      res = await fetch("/api/memos", {');
+  h.push('      res = await fetch(base, {');
   h.push('        method: "POST",');
   h.push('        headers: { "Content-Type": "application/json" },');
-  h.push('        body: JSON.stringify({ title: title, content: content, folderIds: getSelectedFolders() })');
+  h.push('        body: JSON.stringify(body)');
   h.push('      });');
   h.push('    }');
   h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
   h.push('    if (res.ok) {');
   h.push('      var memo = await res.json();');
+  h.push('      var cache = isHidden ? hiddenMemosCache : memosCache;');
   h.push('      if (id) {');
-h.push('        for (var i = 0; i < memosCache.length; i++) {');
-h.push('          if (memosCache[i].id === id) {');
-h.push('            memosCache[i] = memo;');
+h.push('        for (var i = 0; i < cache.length; i++) {');
+h.push('          if (cache[i].id === id) {');
+h.push('            cache[i] = memo;');
 h.push('            break;');
 h.push('          }');
 h.push('        }');
-h.push('        memosCache.sort(function(a,b){ return b.updatedAt - a.updatedAt; });');
+h.push('        cache.sort(function(a,b){ return b.updatedAt - a.updatedAt; });');
   h.push('      } else {');
-h.push('        memosCache.push(memo);');
-h.push('        memosCache.sort(function(a,b){ return b.updatedAt - a.updatedAt; });');
+h.push('        cache.push(memo);');
+h.push('        cache.sort(function(a,b){ return b.updatedAt - a.updatedAt; });');
 h.push('      }');
 h.push('      closeModal();');
 h.push('      renderMemoList();');
@@ -1503,10 +1920,12 @@ h.push('    } else {');
   h.push('async function deleteMemoDirect(id) {');
   h.push('  if (!confirm("确定要删除这条备忘录吗？")) return;');
   h.push('  try {');
-  h.push('    var res = await fetch("/api/memos/" + id, { method: "DELETE" });');
+  h.push('    var isHidden = currentFolder === "hidden";');
+  h.push('    var res = await fetch((isHidden ? "/api/hidden-memos/" : "/api/memos/") + id, { method: "DELETE" });');
   h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
   h.push('    if (res.ok) {');
-  h.push('      memosCache = memosCache.filter(function(m) { return m.id !== id; });');
+  h.push('      if (isHidden) hiddenMemosCache = hiddenMemosCache.filter(function(m) { return m.id !== id; });');
+  h.push('      else memosCache = memosCache.filter(function(m) { return m.id !== id; });');
   h.push('      renderMemoList();');
   h.push('    } else {');
   h.push('      toast("删除失败");');
@@ -1516,8 +1935,73 @@ h.push('    } else {');
   h.push('  }');
   h.push('}');
   h.push('');
+  h.push('var hiddenAuthCallback = null;');
+  h.push('function showHiddenPasswordModal(cb) {');
+  h.push('  hiddenAuthCallback = cb;');
+  h.push('  document.getElementById("hiddenPassInput").value = "";');
+  h.push('  document.body.classList.add("modal-open");');
+  h.push('  document.getElementById("hiddenModal").classList.add("active");');
+  h.push('  document.getElementById("hiddenPassInput").focus();');
+  h.push('}');
+  h.push('function closeHiddenPasswordModal() {');
+  h.push('  document.body.classList.remove("modal-open");');
+  h.push('  document.getElementById("hiddenModal").classList.remove("active");');
+  h.push('}');
+  h.push('async function submitHiddenPassword() {');
+  h.push('  var pwd = document.getElementById("hiddenPassInput").value;');
+  h.push('  if (!pwd) { toast("请输入隐藏密码"); return; }');
+  h.push('  try {');
+  h.push('    var res = await fetch("/api/hidden-auth", {');
+  h.push('      method: "POST",');
+  h.push('      headers: { "Content-Type": "application/json" },');
+  h.push('      body: JSON.stringify({ password: pwd })');
+  h.push('    });');
+  h.push('    if (res.ok) {');
+  h.push('      var cb = hiddenAuthCallback;');
+  h.push('      hiddenAuthCallback = null;');
+  h.push('      closeHiddenPasswordModal();');
+  h.push('      if (cb) cb();');
+  h.push('    } else {');
+  h.push('      toast(res.status === 429 ? "尝试次数过多，请稍后再试" : "密码错误");');
+  h.push('    }');
+  h.push('  } catch(e) { toast("网络错误"); }');
+  h.push('}');
+  h.push('function cancelHiddenPassword() {');
+  h.push('  hiddenAuthCallback = null;');
+  h.push('  closeHiddenPasswordModal();');
+  h.push('}');
+  h.push('async function toggleHidden(id, hide) {');
+  h.push('  if (hide && !confirm("确认隐藏这条备忘录吗？隐藏后需输入隐藏密码才能查看。")) return;');
+  h.push('  try {');
+  h.push('    var res = await fetch("/api/memos/" + id + "/hidden", {');
+  h.push('      method: "PUT",');
+  h.push('      headers: { "Content-Type": "application/json" },');
+  h.push('      body: JSON.stringify({ hidden: hide })');
+  h.push('    });');
+  h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
+  h.push('    if (res.status === 403) { showHiddenPasswordModal(function() { toggleHidden(id, hide); }); return; }');
+  h.push('    if (res.ok) {');
+  h.push('      if (hide) {');
+  h.push('        memosCache = memosCache.filter(function(m) { return m.id !== id; });');
+  h.push('        renderMemoList();');
+  h.push('        renderFolderList();');
+  h.push('        toast("已隐藏");');
+  h.push('      } else {');
+  h.push('        var memo = await res.json();');
+  h.push('        hiddenMemosCache = hiddenMemosCache.filter(function(m) { return m.id !== id; });');
+  h.push('        memosCache.push(memo);');
+  h.push('        memosCache.sort(function(a,b){ return b.updatedAt - a.updatedAt; });');
+  h.push('        renderMemoList();');
+  h.push('        renderFolderList();');
+  h.push('        toast("已取消隐藏");');
+  h.push('      }');
+  h.push('    } else { toast("操作失败"); }');
+  h.push('  } catch(e) { toast("网络错误"); }');
+  h.push('}');
+  h.push('');
   h.push('function copyMemoContent(id) {');
-  h.push('  var memo = memosCache.find(function(m) { return m.id === id; });');
+  h.push('  var cache = currentFolder === "hidden" ? hiddenMemosCache : memosCache;');
+  h.push('  var memo = cache.find(function(m) { return m.id === id; });');
   h.push('  if (!memo) { toast("备忘录不存在"); return; }');
   h.push('  var text = (memo.title || "") + "\\n" + (memo.content || "");');
   h.push('  navigator.clipboard.writeText(text).then(function() {');
@@ -1558,10 +2042,10 @@ h.push('    } else {');
   h.push('}');
 h.push('');
 h.push('async function toggleStar(id) {');
-h.push('  try {');
-h.push('    var res = await fetch("/api/memos/" + id + "/star", { method: "PUT" });');
-h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
-h.push('    if (res.ok) {');
+  h.push('  try {');
+  h.push('    var res = await fetch("/api/memos/" + id + "/star", { method: "PUT" });');
+  h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
+  h.push('    if (res.ok) {');
 h.push('      var memo = await res.json();');
 h.push('      for (var i = 0; i < memosCache.length; i++) {');
 h.push('        if (memosCache[i].id === id) { memosCache[i] = memo; break; }');
@@ -1579,6 +2063,7 @@ h.push('function selectFolder(id) {');
   h.push('  document.querySelectorAll("[data-folder]").forEach(function(el) {');
   h.push('    el.classList.toggle("active", el.dataset.folder === id);');
   h.push('  });');
+  h.push('  if (id === "hidden") { loadHiddenMemos(); return; }');
   h.push('  renderMemoList();');
   h.push('}');
   h.push('');
@@ -1686,6 +2171,13 @@ h.push('function selectFolder(id) {');
   h.push('  } catch(e) { toast("网络错误"); }');
   h.push('}');
   h.push('');
+  h.push('function setEditorFolderField(isHidden) {');
+  h.push('  var field = document.getElementById("memoFolders");');
+  h.push('  if (!field) return;');
+  h.push('  field.closest(".field").style.display = isHidden ? "none" : "";');
+  h.push('  if (!isHidden) updateFolderCheckboxes();');
+  h.push('}');
+  h.push('');
   h.push('function updateFolderCheckboxes() {');
   h.push('  var container = document.getElementById("memoFolders");');
   h.push('  if (!container) return;');
@@ -1714,12 +2206,13 @@ h.push('function selectFolder(id) {');
   h.push('');
   h.push('// ── 键盘快捷键 ───');
   h.push('document.addEventListener("keydown", function(e) {');
-  h.push('  if (e.key === "Escape") {');
+h.push('  if (e.key === "Escape") {');
   h.push('    if (modalOverlay.classList.contains("active")) closeModal();');
   h.push('    if (document.getElementById("folderModal").classList.contains("active")) {');
-      h.push('      document.body.classList.remove("modal-open");');
+  h.push('      document.body.classList.remove("modal-open");');
   h.push('      document.getElementById("folderModal").classList.remove("active");');
   h.push('    }');
+  h.push('    if (document.getElementById("hiddenModal").classList.contains("active")) cancelHiddenPassword();');
   h.push('  }');
   h.push('  if ((e.ctrlKey || e.metaKey) && (e.key === "Enter" || e.key === "s")) {');
   h.push('    e.preventDefault();');
@@ -1736,8 +2229,13 @@ h.push('function selectFolder(id) {');
   h.push('  document.getElementById("folderModal").classList.remove("active");');
   h.push('});');
   h.push('document.getElementById("folderSaveBtn").addEventListener("click", saveFolder);');
+  h.push('document.getElementById("hiddenCancelBtn").addEventListener("click", cancelHiddenPassword);');
+  h.push('document.getElementById("hiddenAuthBtn").addEventListener("click", submitHiddenPassword);');
+  h.push('document.getElementById("hiddenPassInput").addEventListener("keydown", function(e) {');
+  h.push('  if (e.key === "Enter") submitHiddenPassword();');
+  h.push('});');
   h.push('// 侧边栏「所有备忘录」和「未分类」点击');
-  h.push('document.querySelectorAll("[data-folder=\\"all\\"],[data-folder=\\"starred\\"],[data-folder=\\"none\\"],[data-folder=\\"shared\\"]").forEach(function(el) {');
+  h.push('document.querySelectorAll("[data-folder=\\"all\\"],[data-folder=\\"starred\\"],[data-folder=\\"none\\"],[data-folder=\\"shared\\"],[data-folder=\\"hidden\\"]").forEach(function(el) {');
   h.push('  el.addEventListener("click", function() { selectFolder(el.dataset.folder); });');
   h.push('});');
   h.push('document.getElementById("folderName").addEventListener("keydown", function(e) {');
@@ -1800,9 +2298,10 @@ h.push('function selectFolder(id) {');
   h.push('  var id = editMemoId.value;');
   h.push('  if (!id || !confirm("确定要删除这条备忘录吗？")) return;');
   h.push('  try {');
-  h.push('    var r = await fetch("/api/memos/" + id, { method: "DELETE" });');
+  h.push('    var isHidden = currentFolder === "hidden";');
+  h.push('    var r = await fetch((isHidden ? "/api/hidden-memos/" : "/api/memos/") + id, { method: "DELETE" });');
   h.push('    if (r.status === 401) { window.location.href = "/"; return; }');
-  h.push('    if (r.ok) { memosCache = memosCache.filter(function(m) { return m.id !== id; }); closeModal(); renderMemoList(); }');
+  h.push('    if (r.ok) { if (isHidden) hiddenMemosCache = hiddenMemosCache.filter(function(m) { return m.id !== id; }); else memosCache = memosCache.filter(function(m) { return m.id !== id; }); closeModal(); renderMemoList(); }');
   h.push('    else toast("删除失败");');
   h.push('  } catch(e) { toast("网络错误"); }');
   h.push('});');
@@ -1812,6 +2311,25 @@ h.push('function selectFolder(id) {');
   h.push('  }, function() {');
   h.push('    window.location.href = "/";');
   h.push('  });');
+  h.push('});');
+  h.push('');
+  h.push('// 未分类（sidebar空白）作为拖拽目标 —— sidebar 不重建，仅绑定一次');
+  h.push('var sidebar = document.getElementById("folderSidebar");');
+  h.push('sidebar.addEventListener("dragover", function(e) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; sidebar.classList.add("drag-over"); });');
+  h.push('sidebar.addEventListener("dragleave", function(e) {');
+  h.push('  if (!sidebar.contains(e.relatedTarget)) sidebar.classList.remove("drag-over");');
+  h.push('});');
+  h.push('sidebar.addEventListener("drop", function(e) {');
+  h.push('  e.preventDefault();');
+  h.push('  sidebar.classList.remove("drag-over");');
+  h.push('  var memoId = e.dataTransfer.getData("text/memo-id");');
+  h.push('  var target = e.target.closest("[data-folder]");');
+  h.push('  if (target) {');
+  h.push('    // 拖到「隐藏」= 隐藏该备忘录；其它 folder-item 由各自 drop 处理');
+  h.push('    if (target.dataset.folder === "hidden" && memoId) toggleHidden(memoId, true);');
+  h.push('    return;');
+  h.push('  }');
+  h.push('  if (memoId) moveMemoToFolder(memoId, null);');
   h.push('});');
   h.push('');
   h.push('// 深色模式');

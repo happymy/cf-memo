@@ -14,6 +14,8 @@ kv_namespaces = [
 # wrangler secret put USERNAME
 # wrangler secret put PASSWORD
 # wrangler secret put SESSION_SECRET
+# wrangler secret put HIDDEN_PASSWORD   # 隐藏备忘录独立密码，未设置时隐藏功能返回 500
+# MEMO_ENCRYPT_KEY 请用 wrangler secret 设置，格式: 32 字节 key 的 base64（如 .env）
 [vars]
 # 以下仅为本地开发使用，生产环境请用 wrangler secret 设置
 # USERNAME = "admin"
