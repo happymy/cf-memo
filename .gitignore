@@ -5,3 +5,5 @@ worker-configuration.d.ts
 node_modules/
 *.log
 .dev.vars
+.playwright-mcp/
+main-app.yml
