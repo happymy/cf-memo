@@ -4,3 +4,4 @@ worker-configuration.d.ts
 .env.*
 node_modules/
 *.log
+.dev.vars

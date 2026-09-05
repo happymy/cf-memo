@@ -448,7 +448,7 @@ async function handleListMemos(user, env) {
   } while (cursor);
   // 按更新时间倒序
   memos.sort((a, b) => b.updatedAt - a.updatedAt);
-  return json(memos, 200, { 'Cache-Control': 'private, max-age=2, s-maxage=0' });
+  return json(memos, 200, { 'Cache-Control': 'private, no-store' });
 }
 
 async function handleCreateMemo(request, env) {
@@ -909,7 +909,7 @@ function serveSharePage(token, env) {
           'Content-Type': 'text/html; charset=UTF-8',
           'X-Content-Type-Options': 'nosniff',
           'X-Frame-Options': 'DENY',
-          'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline' 'self'; script-src 'unsafe-inline' 'self'",
+          'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline' 'self'; script-src 'unsafe-inline' 'self' https://static.cloudflareinsights.com; font-src 'self' data:",
           'Cache-Control': 'public, max-age=5',
         },
       });
@@ -934,7 +934,7 @@ async function handleListFolders(env) {
     cursor = list.list_complete ? undefined : list.cursor;
   } while (cursor);
   folders.sort((a, b) => a.createdAt - b.createdAt);
-  return json(folders, 200, { 'Cache-Control': 'private, max-age=2, s-maxage=0' });
+  return json(folders, 200, { 'Cache-Control': 'private, no-store' });
 }
 
 async function handleCreateFolder(request, env) {
@@ -1069,7 +1069,7 @@ function securityHeaders() {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'same-origin',
-    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'none'",
+    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; form-action 'none'",
     'Permissions-Policy': 'interest-cohort=()',
     'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
   };
@@ -1531,6 +1531,7 @@ function serveAppPage() {
   h.push('var hiddenMemosCache = [];');
   h.push('var foldersCache = [];');
   h.push('var currentFolder = "all";');
+  h.push('var lastFolderBeforeHidden = "all";');
   h.push('var searchQuery = "";');
   h.push('var isSaving = false;');
   h.push('var batchMode = false;');
@@ -1556,7 +1557,7 @@ function serveAppPage() {
   h.push('// ── 加载文件夹列表 ───');
   h.push('async function loadFolders() {');
   h.push('  try {');
-  h.push('    var res = await fetch("/api/folders");');
+  h.push('    var res = await fetch("/api/folders", { cache: "no-store" });');
   h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
   h.push('    foldersCache = await res.json();');
   h.push('    renderFolderList();');
@@ -1603,7 +1604,7 @@ function serveAppPage() {
   h.push('  isLoading = true;');
   h.push('  renderMemoList();');
   h.push('  try {');
-  h.push('    var res = await fetch("/api/memos");');
+  h.push('    var res = await fetch("/api/memos", { cache: "no-store" });');
   h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
   h.push('    memosCache = await res.json();');
   h.push('    isLoading = false;');
@@ -1618,11 +1619,11 @@ h.push('');
   h.push('  isLoading = true;');
   h.push('  renderMemoList();');
   h.push('  try {');
-  h.push('    var res = await fetch("/api/memos?view=hidden");');
+  h.push('    var res = await fetch("/api/memos?view=hidden", { cache: "no-store" });');
   h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
   h.push('    if (res.status === 403) {');
   h.push('      isLoading = false;');
-  h.push('      showHiddenPasswordModal(loadHiddenMemos);');
+  h.push('      if (currentFolder === "hidden") showHiddenPasswordModal(loadHiddenMemos);');
   h.push('      return;');
   h.push('    }');
   h.push('    hiddenMemosCache = await res.json();');
@@ -1657,7 +1658,7 @@ h.push('');
   h.push('    return;');
   h.push('  }');
   h.push('  if (filtered.length === 0) {');
-  h.push('    var emptyMsg = currentFolder === "starred" ? "还没有星标备忘录，点击卡片上的 ⭐ 星标" : currentFolder === "shared" ? "还没有已分享的备忘录" : currentFolder === "hidden" ? "还没有隐藏备忘录，点击右上角「新建」加密保存" : currentFolder === "none" ? "所有备忘录都已分类" : q ? "没有匹配的备忘录" : "还没有备忘录，点击右上角「新建」开始";');
+  h.push('    var emptyMsg = currentFolder === "starred" ? "还没有星标备忘录，点击卡片上的 ⭐ 星标" : currentFolder === "shared" ? "还没有已分享的备忘录" : currentFolder === "hidden" ? "还没有隐藏备忘录，点击右上角「新建」加密保存" : currentFolder === "none" ? "所有备忘录都已分类" : q ? "没有匹配「" + q + "」的备忘录，可清空搜索重新查看" : "还没有备忘录，点击右上角「新建」开始";');
   h.push('    container.innerHTML = "<div class=\\"empty\\"><span class=\\"empty-icon\\">📝</span>" + emptyMsg + "</div>";');
   h.push('    return;');
   h.push('  }');
@@ -1697,6 +1698,12 @@ h.push('');
   h.push('    card += "</div>";');
   h.push('    return card;');
   h.push('  }).join("");');
+  h.push('  container.querySelectorAll(".memo-card[data-memo-id]").forEach(function(card) {');
+  h.push('    card.addEventListener("click", function(e) {');
+  h.push('      if (e.target.closest("[data-edit],[data-delete],[data-star],[data-share],[data-copy],[data-hidden],[data-batch],.drag-handle")) return;');
+  h.push('      openEditModal(card.dataset.memoId);');
+  h.push('    });');
+  h.push('  });');
   h.push('  container.querySelectorAll("[data-edit]").forEach(function(btn) {');
   h.push('    btn.addEventListener("click", function() { openEditModal(btn.dataset.edit); });');
   h.push('  });');
@@ -1969,6 +1976,7 @@ h.push('    } else {');
   h.push('function cancelHiddenPassword() {');
   h.push('  hiddenAuthCallback = null;');
   h.push('  closeHiddenPasswordModal();');
+  h.push('  if (currentFolder === "hidden") selectFolder(lastFolderBeforeHidden);');
   h.push('}');
   h.push('async function toggleHidden(id, hide) {');
   h.push('  if (hide && !confirm("确认隐藏这条备忘录吗？隐藏后需输入隐藏密码才能查看。")) return;');
@@ -2058,6 +2066,7 @@ h.push('      }');
   h.push('');
   h.push('// ── 文件夹操作 ───');
 h.push('function selectFolder(id) {');
+  h.push('  if (id === "hidden" && currentFolder !== "hidden") lastFolderBeforeHidden = currentFolder;');
   h.push('  currentFolder = id;');
   h.push('  // 更新 sidebar 高亮');
   h.push('  document.querySelectorAll("[data-folder]").forEach(function(el) {');
