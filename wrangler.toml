@@ -3,21 +3,26 @@ main = "src/index.js"
 compatibility_date = "2025-01-01"
 
 # KV 命名空间 - 部署前需先创建
-# 运行: wrangler kv ！namespace create MEMOS_KV
+# 运行: wrangler kv namespace create MEMOS_KV
 # 然后将输出的 id 替换下方的占位符
 kv_namespaces = [
   { binding = "MEMOS_KV", id = "009449e6020d4b06919f14439690bf12" }
 ]
 
-# 环境变量 - 预设登录凭证和会话密钥
-# 部署时设置实际值:
-# wrangler secret put USERNAME
-# wrangler secret put PASSWORD
-# wrangler secret put SESSION_SECRET
-# wrangler secret put HIDDEN_PASSWORD   # 隐藏备忘录独立密码，未设置时隐藏功能返回 500
-# MEMO_ENCRYPT_KEY 请用 wrangler secret 设置，格式: 32 字节 key 的 base64（如 .env）
+# ─────────────────────────────────────────────────────────────
+# Secrets（生产环境，用 wrangler secret put 逐个设置，不要写入本文件）
+#   wrangler secret put USERNAME            # 登录用户名
+#   wrangler secret put PASSWORD            # 登录密码
+#   wrangler secret put SESSION_SECRET      # 会话签名密钥（随机长字符串）
+#   wrangler secret put HIDDEN_PASSWORD     # 隐藏备忘录独立密码（可选，未设置时隐藏功能返回 500）
+#   wrangler secret put MEMO_ENCRYPT_KEY    # 隐藏备忘录 AES-GCM 加密密钥（可选）
+#                                            # 生成: openssl rand -base64 32
+#                                            # 格式: 32 字节密钥的 Base64 编码
+# ─────────────────────────────────────────────────────────────
 [vars]
-# 以下仅为本地开发使用，生产环境请用 wrangler secret 设置
+# 以下仅为本地开发使用（wrangler dev），生产环境的值放在 Secrets 中
 # USERNAME = "admin"
 # PASSWORD = "memo2024"
 # SESSION_SECRET = "your-random-secret-string-change-me"
+# HIDDEN_PASSWORD = "hidden-memo-password"
+# MEMO_ENCRYPT_KEY = "base64-encoded-32-byte-key-here"
