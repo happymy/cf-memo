@@ -24,28 +24,32 @@
 ```
 cf-memo/
 ├── README.md          # 本文件
-├── wrangler.toml      # Cloudflare Worker 部署配置
-└── src/
-    └── index.js       # Worker 全部逻辑 (路由/认证/CRUD/HTML)
+├── package.json       # 脚本与开发依赖（vitest / wrangler）
+├── wrangler.toml      # Cloudflare Worker 部署配置（已填 KV id）
+├── src/
+│   └── index.js       # Worker 全部逻辑 (路由/认证/CRUD/HTML)
+└── test/
+    └── index.test.js  # Vitest 测试
 ```
 
 ## 快速开始
 
-### 1. 安装 Wrangler CLI
+### 1. 安装依赖
 
 ```bash
-npm install -g wrangler
-wrangler login
+npm install
 ```
 
-### 2. 创建 KV 命名空间
+wrangler CLI 通过本地依赖提供，使用 `npx wrangler ...`（或 `npm run`）。
+
+### 2. KV 命名空间（首次部署时执行一次）
 
 ```bash
-cd cf-memo
-wrangler kv namespace create MEMOS_KV
+npx wrangler login
+npx wrangler kv namespace create MEMOS_KV
 ```
 
-记录输出中的 `id`，将其填入 `wrangler.toml` 的 `kv_namespaces[0].id` 字段：
+将输出的 `id` 填入 `wrangler.toml` 的 `kv_namespaces[0].id`（当前文件已含线上实例 id）：
 
 ```toml
 kv_namespaces = [
@@ -55,44 +59,49 @@ kv_namespaces = [
 
 ### 3. 设置环境变量（生产环境）
 
-使用 `wrangler secret` 安全存储敏感信息：
+使用 `npx wrangler secret` 安全存储敏感信息：
 
 ```bash
-wrangler secret put USERNAME
+npx wrangler secret put USERNAME
 # 输入: admin (或其他自定义用户名)
 
-wrangler secret put PASSWORD
+npx wrangler secret put PASSWORD
 # 输入: 你的密码
 
-wrangler secret put SESSION_SECRET
+npx wrangler secret put SESSION_SECRET
 # 输入: 一个随机长字符串，用于 HMAC 签名
 ```
 
 启用隐藏备忘录功能时，额外设置：
 
 ```bash
-wrangler secret put HIDDEN_PASSWORD
+npx wrangler secret put HIDDEN_PASSWORD
 # 输入: 隐藏视图的独立访问密码
 
-wrangler secret put MEMO_ENCRYPT_KEY
+npx wrangler secret put MEMO_ENCRYPT_KEY
 # 输入: 32 字节密钥的 Base64 编码（AES-GCM 加密隐藏备忘录正文）
+# 生成: openssl rand -base64 32
 ```
 
 > ⚠️ **不要**在 `wrangler.toml` 的 `[vars]` 中硬编码生产环境密钥。
 
-### 4. 本地开发（可选）
+### 4. 本地开发
 
-若需本地测试，可临时取消 `wrangler.toml` 中 `[vars]` 下的注释：
+本地运行默认读取项目根目录的 `.dev.vars`（已 gitignore，不进版本库）。参考 `.env` 示例创建：
 
 ```toml
-[vars]
+# .dev.vars
 USERNAME = "admin"
-PASSWORD = "test123"
+PASSWORD = "memo2024"
 SESSION_SECRET = "dev-secret-change-me"
+HIDDEN_PASSWORD = "hidden-memo-password"          # 可选
+MEMO_ENCRYPT_KEY = "base64-encoded-32-byte-key"   # 可选，即 `openssl rand -base64 32` 的输出
 ```
 
+> MEMO_ENCRYPT_KEY 由 `openssl rand -base64 32` 生成，`wrangler secret put` 与 `.dev.vars` 中填同一字符串。
+
 ```bash
-wrangler dev
+npx wrangler dev
 ```
 
 访问 `http://localhost:8787` 即可看到登录页面。
@@ -100,7 +109,13 @@ wrangler dev
 ### 5. 部署到 Cloudflare
 
 ```bash
-wrangler deploy
+npm run deploy   # 等价于: npx wrangler deploy
+```
+
+### 6. 运行测试
+
+```bash
+npm test         # 等价于: npx vitest
 ```
 
 ## API 接口
