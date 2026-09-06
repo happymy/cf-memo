@@ -1811,7 +1811,7 @@ h.push('');
   h.push('  var memos = isHidden ? hiddenMemosCache : memosCache;');
   h.push('  if (memos.length === 0) {');
   h.push('    try {');
-  h.push('      var res = await fetch(isHidden ? "/api/memos?view=hidden" : "/api/memos");');
+  h.push('      var res = await fetch(isHidden ? "/api/memos?view=hidden" : "/api/memos", { cache: "no-store" });');
   h.push('      if (res.status === 401) { window.location.href = "/"; return; }');
   h.push('      if (res.ok) { memos = await res.json(); if (isHidden) hiddenMemosCache = memos; else memosCache = memos; }');
   h.push('      else { toast("加载失败，请重试"); closeModal(); reloadFn(); return; }');
