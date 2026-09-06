@@ -1658,7 +1658,7 @@ h.push('');
   h.push('    return;');
   h.push('  }');
   h.push('  if (filtered.length === 0) {');
-  h.push('    var emptyMsg = currentFolder === "starred" ? "还没有星标备忘录，点击卡片上的 ⭐ 星标" : currentFolder === "shared" ? "还没有已分享的备忘录" : currentFolder === "hidden" ? "还没有隐藏备忘录，点击右上角「新建」加密保存" : currentFolder === "none" ? "所有备忘录都已分类" : q ? "没有匹配「" + q + "」的备忘录，可清空搜索重新查看" : "还没有备忘录，点击右上角「新建」开始";');
+  h.push('    var emptyMsg = q ? "没有匹配「" + q + "」的备忘录，可清空搜索重新查看" : currentFolder === "starred" ? "还没有星标备忘录，点击卡片上的 ⭐ 星标" : currentFolder === "shared" ? "还没有已分享的备忘录" : currentFolder === "hidden" ? "还没有隐藏备忘录，点击右上角「新建」加密保存" : currentFolder === "none" ? "所有备忘录都已分类" : "还没有备忘录，点击右上角「新建」开始";');
   h.push('    container.innerHTML = "<div class=\\"empty\\"><span class=\\"empty-icon\\">📝</span>" + emptyMsg + "</div>";');
   h.push('    return;');
   h.push('  }');
