@@ -268,6 +268,13 @@ async function handleRequest(request, env) {
         if (method === 'PUT') return handleStarMemo(memoId, env);
       }
 
+      // 折叠/展开切换，无需校验备忘录是否存在（仅视图偏好）
+      if (path.startsWith('/api/memos/') && path.endsWith('/expand')) {
+        const memoId = path.slice('/api/memos/'.length, -'/expand'.length);
+        if (!memoId) return json({ error: 'Missing memo id' }, 400);
+        if (method === 'PUT') return handleSetMemoExpanded(memoId, env);
+      }
+
       if (path.startsWith('/api/memos/') && path.endsWith('/share')) {
         const memoId = path.slice('/api/memos/'.length, -'/share'.length);
         if (!memoId) return json({ error: 'Missing memo id' }, 400);
@@ -430,6 +437,18 @@ function handleLogout(request) {
   });
 }
 
+// 读取所有展开状态标记，缺省视为折叠
+async function loadExpandedIds(env) {
+  const set = new Set();
+  let cursor;
+  do {
+    const list = await env.MEMOS_KV.list({ prefix: 'expand:', cursor: cursor, limit: 1000 });
+    for (const k of list.keys) set.add(k.name.slice('expand:'.length));
+    cursor = list.list_complete ? undefined : list.cursor;
+  } while (cursor);
+  return set;
+}
+
 // ── 备忘录 CRUD ──────────────────────────────────────────────────
 async function handleListMemos(user, env) {
   const memos = [];
@@ -440,7 +459,9 @@ async function handleListMemos(user, env) {
     for (const raw of raws) {
       if (raw) {
         try {
-          memos.push(JSON.parse(raw));
+          const m = JSON.parse(raw);
+          m.expanded = false;
+          memos.push(m);
         } catch { /* 忽略损坏数据 */ }
       }
     }
@@ -448,6 +469,8 @@ async function handleListMemos(user, env) {
   } while (cursor);
   // 按更新时间倒序
   memos.sort((a, b) => b.updatedAt - a.updatedAt);
+  const expanded = await loadExpandedIds(env);
+  for (const m of memos) m.expanded = expanded.has(m.id);
   return json(memos, 200, { 'Cache-Control': 'private, no-store' });
 }
 
@@ -605,6 +628,7 @@ async function handleListHiddenMemos(env) {
           const m = await decryptJson(raw, env);
           // 旧版本隐藏数据可能没有 folderIds 字段，统一默认空数组供前端渲染文件夹徽标
           if (!m.folderIds) m.folderIds = [];
+          m.expanded = false;
           memos.push(m);
         } catch { /* 忽略解密失败/损坏数据 */ }
       }
@@ -612,6 +636,8 @@ async function handleListHiddenMemos(env) {
     cursor = list.list_complete ? undefined : list.cursor;
   } while (cursor);
   memos.sort((a, b) => b.updatedAt - a.updatedAt);
+  const expanded = await loadExpandedIds(env);
+  for (const m of memos) m.expanded = expanded.has(m.id);
   return json(memos, 200, { 'Cache-Control': 'no-store' });
 }
 
@@ -750,6 +776,18 @@ async function handleUnshareMemo(memoId, env) {
     ]);
   }
   return json({ ok: true });
+}
+
+// 折叠/展开状态：KV 存 expand:<memoId>，缺省折叠
+async function handleSetMemoExpanded(memoId, env) {
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(memoId)) {
+    return json({ error: 'Invalid memo id' }, 400);
+  }
+  const key = 'expand:' + memoId;
+  const exists = await env.MEMOS_KV.get(key);
+  if (exists) await env.MEMOS_KV.delete(key);
+  else await env.MEMOS_KV.put(key, '1');
+  return json({ ok: true, expanded: !exists });
 }
 
 async function handleStarMemo(memoId, env) {
@@ -1284,6 +1322,8 @@ function serveAppPage() {
   h.push('  .memo-card.starred-card { background:var(--star-bg); }');
   h.push('  .star-btn { font-size:16px; line-height:1; }');
   h.push('  .star-btn.starred { color:#f59e0b; }');
+  h.push('  .expand-toggle { background:none; border:none; color:var(--text-muted); font-size:12px; cursor:pointer; padding:2px 4px; border-radius:4px; line-height:1; transition:color .15s; flex-shrink:0; }');
+  h.push('  .expand-toggle:hover { color:var(--primary); }');
   h.push('  .memo-card h3 { margin-bottom:8px; font-size:16px; color:var(--text); display:flex; align-items:center; gap:8px; }');
   h.push('  .memo-card h3 .memo-folder { font-size:11px; color:var(--primary); background:var(--primary-light); padding:1px 8px; border-radius:10px; font-weight:400; }');
   h.push('  .memo-card p { color:var(--text-secondary); font-size:14px; line-height:1.7; white-space:pre-wrap; }');
@@ -1679,12 +1719,16 @@ h.push('');
   h.push('        return f ? "<span class=\\"memo-folder\\">📁 " + escapeHtml(f.name) + "</span>" : "";');
   h.push('      }).join(" ");');
   h.push('    }');
-  h.push('    card += "<h3>" + escapeHtml(m.title || "(无标题)") + folderNames + "</h3>";');
+  h.push('    var expanded = m.expanded === true;');
+  h.push('    card += "<h3><button class=\\"expand-toggle\\" data-expand=\\"" + m.id + "\\" title=\\"" + (expanded ? "折叠" : "展开") + "\\">" + (expanded ? "▼" : "▶") + "</button> " + escapeHtml(m.title || "(无标题)") + folderNames + "</h3>";');
+  h.push('    card += "<div class=\\"memo-content\\">";');
   h.push('    if (m.content) {');
-  h.push('      card += "<p>" + escapeHtml(m.content) + "</p>";');
+  h.push('      if (expanded) card += "<p>" + escapeHtml(m.content) + "</p>";');
+  h.push('      else card += "<p>" + escapeHtml(m.content.length > 100 ? m.content.slice(0, 100) : m.content) + (m.content.length > 100 ? "…" : "") + "</p>";');
   h.push('    } else {');
   h.push('      card += "<p style=\\"color:#ccc;\\">无内容</p>";');
   h.push('    }');
+  h.push('    card += "</div>";');
   h.push('    card += "<div class=\\"time\\">更新于 " + date + "</div>";');
   h.push('    card += "<div class=\\"card-actions\\">";');
   h.push('    if (isHidden) card += "<button title=\\"取消隐藏\\" data-hidden=\\"" + m.id + "\\" data-hide=\\"false\\">\uD83D\uDC41\uFE0F</button>";');
@@ -1700,9 +1744,12 @@ h.push('');
   h.push('  }).join("");');
   h.push('  container.querySelectorAll(".memo-card[data-memo-id]").forEach(function(card) {');
   h.push('    card.addEventListener("click", function(e) {');
-  h.push('      if (e.target.closest("[data-edit],[data-delete],[data-star],[data-share],[data-copy],[data-hidden],[data-batch],.drag-handle")) return;');
+  h.push('      if (e.target.closest("[data-edit],[data-delete],[data-star],[data-share],[data-copy],[data-hidden],[data-batch],[data-expand],.drag-handle")) return;');
   h.push('      openEditModal(card.dataset.memoId);');
   h.push('    });');
+  h.push('  });');
+  h.push('  container.querySelectorAll("[data-expand]").forEach(function(btn) {');
+  h.push('    btn.addEventListener("click", function() { toggleMemoExpand(btn.dataset.expand); });');
   h.push('  });');
   h.push('  container.querySelectorAll("[data-edit]").forEach(function(btn) {');
   h.push('    btn.addEventListener("click", function() { openEditModal(btn.dataset.edit); });');
@@ -2062,6 +2109,22 @@ h.push('      }');
   h.push('      updateFolderCounts();');
   h.push('    }');
   h.push('  } catch(e) { toast("网络错误"); }');
+  h.push('}');
+  h.push('');
+  h.push('async function toggleMemoExpand(id) {');
+  h.push('  updateMemoLocalExpanded(id);');
+  h.push('  try {');
+  h.push('    var res = await fetch("/api/memos/" + id + "/expand", { method: "PUT" });');
+  h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
+  h.push('    if (!res.ok) updateMemoLocalExpanded(id);');
+  h.push('  } catch(e) { updateMemoLocalExpanded(id); toast("网络错误"); }');
+  h.push('}');
+  h.push('');
+  h.push('function updateMemoLocalExpanded(id) {');
+  h.push('  for (var i = 0; i < memosCache.length; i++) {');
+  h.push('    if (memosCache[i].id === id) { memosCache[i].expanded = !memosCache[i].expanded; break; }');
+  h.push('  }');
+  h.push('  renderMemoList();');
   h.push('}');
   h.push('');
   h.push('// ── 文件夹操作 ───');

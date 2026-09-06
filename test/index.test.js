@@ -257,6 +257,39 @@ describe("Star", () => {
   });
 });
 
+describe("Expand/Collapse", () => {
+  it("默认折叠，切换后 expanded 翻转并持久化到列表", async () => {
+    const created = await (await authedFetch("/api/memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "折叠测试" }),
+    })).json();
+    let list = await (await authedFetch("/api/memos")).json();
+    expect(list.find(x => x.id === created.id).expanded).toBe(false);
+
+    const res = await authedFetch(`/api/memos/${created.id}/expand`, { method: "PUT" });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.expanded).toBe(true);
+
+    list = await (await authedFetch("/api/memos")).json();
+    expect(list.find(x => x.id === created.id).expanded).toBe(true);
+
+    await authedFetch(`/api/memos/${created.id}/expand`, { method: "PUT" });
+    list = await (await authedFetch("/api/memos")).json();
+    expect(list.find(x => x.id === created.id).expanded).toBe(false);
+  });
+
+  it("隐藏备忘录的 expanded 状态同样持久化", async () => {
+    const created = await (await hiddenAuthFetch("/api/hidden-memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "隐藏折叠" }),
+    })).json();
+    await authedFetch(`/api/memos/${created.id}/expand`, { method: "PUT" });
+    const list = await (await hiddenAuthFetch("/api/memos?view=hidden")).json();
+    expect(list.find(x => x.id === created.id).expanded).toBe(true);
+  });
+});
+
 // ── 隐藏备忘录 ───
 describe("Hidden Memo", () => {
   async function createHidden(title, content) {
