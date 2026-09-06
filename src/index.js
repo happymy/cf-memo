@@ -268,11 +268,11 @@ async function handleRequest(request, env) {
         if (method === 'PUT') return handleStarMemo(memoId, env);
       }
 
-      // 折叠/展开切换，无需校验备忘录是否存在（仅视图偏好）
+      // 折叠/展开状态（视图偏好，需校验备忘录存在）
       if (path.startsWith('/api/memos/') && path.endsWith('/expand')) {
         const memoId = path.slice('/api/memos/'.length, -'/expand'.length);
         if (!memoId) return json({ error: 'Missing memo id' }, 400);
-        if (method === 'PUT') return handleSetMemoExpanded(memoId, env);
+        if (method === 'PUT') return handleSetMemoExpanded(request, memoId, env);
       }
 
       if (path.startsWith('/api/memos/') && path.endsWith('/share')) {
@@ -598,6 +598,7 @@ async function handleDeleteMemo(memoId, env) {
     await env.MEMOS_KV.delete('share:' + memo.shareToken).catch(function(){});
   }
   await env.MEMOS_KV.delete('memo:' + memoId);
+  await env.MEMOS_KV.delete('expand:' + memoId).catch(function(){});
   return json({ ok: true });
 }
 
@@ -736,6 +737,7 @@ async function handleDeleteHiddenMemo(memoId, env) {
   const existing = await env.MEMOS_KV.get('sc:' + memoId);
   if (!existing) return json({ error: 'Memo not found' }, 404);
   await env.MEMOS_KV.delete('sc:' + memoId);
+  await env.MEMOS_KV.delete('expand:' + memoId).catch(function(){});
   return json({ ok: true }, 200, { 'Cache-Control': 'no-store' });
 }
 
@@ -778,16 +780,29 @@ async function handleUnshareMemo(memoId, env) {
   return json({ ok: true });
 }
 
-// 折叠/展开状态：KV 存 expand:<memoId>，缺省折叠
-async function handleSetMemoExpanded(memoId, env) {
+// 折叠/展开状态：KV 存 expand:<memoId>，缺省折叠；幂等写入显式目标状态
+async function handleSetMemoExpanded(request, memoId, env) {
   if (!/^[a-zA-Z0-9_-]{1,40}$/.test(memoId)) {
     return json({ error: 'Invalid memo id' }, 400);
   }
+  const [normal, hidden] = await Promise.all([
+    env.MEMOS_KV.get('memo:' + memoId),
+    env.MEMOS_KV.get('sc:' + memoId),
+  ]);
+  if (!normal && !hidden) return json({ error: 'Memo not found' }, 404);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'Invalid JSON' }, 400);
+  }
+  if (typeof body.expanded !== 'boolean') {
+    return json({ error: 'expanded must be a boolean' }, 400);
+  }
   const key = 'expand:' + memoId;
-  const exists = await env.MEMOS_KV.get(key);
-  if (exists) await env.MEMOS_KV.delete(key);
-  else await env.MEMOS_KV.put(key, '1');
-  return json({ ok: true, expanded: !exists });
+  if (body.expanded) await env.MEMOS_KV.put(key, '1');
+  else await env.MEMOS_KV.delete(key);
+  return json({ ok: true, expanded: body.expanded });
 }
 
 async function handleStarMemo(memoId, env) {
@@ -1724,7 +1739,7 @@ h.push('');
   h.push('    card += "<div class=\\"memo-content\\">";');
   h.push('    if (m.content) {');
   h.push('      if (expanded) card += "<p>" + escapeHtml(m.content) + "</p>";');
-  h.push('      else card += "<p>" + escapeHtml(m.content.length > 100 ? m.content.slice(0, 100) : m.content) + (m.content.length > 100 ? "…" : "") + "</p>";');
+  h.push('      else card += (function(){ var ch = Array.from(m.content); return "<p>" + escapeHtml(ch.length > 100 ? ch.slice(0, 100).join("") : m.content) + (ch.length > 100 ? "…" : "") + "</p>"; })();');
   h.push('    } else {');
   h.push('      card += "<p style=\\"color:#ccc;\\">无内容</p>";');
   h.push('    }');
@@ -1947,7 +1962,9 @@ h.push('');
   h.push('      if (id) {');
 h.push('        for (var i = 0; i < cache.length; i++) {');
 h.push('          if (cache[i].id === id) {');
+h.push('            var prevExpanded = cache[i].expanded;');
 h.push('            cache[i] = memo;');
+h.push('            cache[i].expanded = prevExpanded;');
 h.push('            break;');
 h.push('          }');
 h.push('        }');
@@ -2102,8 +2119,8 @@ h.push('async function toggleStar(id) {');
   h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
   h.push('    if (res.ok) {');
 h.push('      var memo = await res.json();');
-h.push('      for (var i = 0; i < memosCache.length; i++) {');
-h.push('        if (memosCache[i].id === id) { memosCache[i] = memo; break; }');
+  h.push('      for (var i = 0; i < memosCache.length; i++) {');
+h.push('        if (memosCache[i].id === id) { var prevExpanded = memosCache[i].expanded; memosCache[i] = memo; memosCache[i].expanded = prevExpanded; break; }');
 h.push('      }');
   h.push('      renderMemoList();');
   h.push('      updateFolderCounts();');
@@ -2112,17 +2129,29 @@ h.push('      }');
   h.push('}');
   h.push('');
   h.push('async function toggleMemoExpand(id) {');
-  h.push('  updateMemoLocalExpanded(id);');
+  h.push('  var isHidden = currentFolder === "hidden";');
+  h.push('  var cache = isHidden ? hiddenMemosCache : memosCache;');
+  h.push('  var memo = null;');
+  h.push('  for (var i = 0; i < cache.length; i++) {');
+  h.push('    if (cache[i].id === id) { memo = cache[i]; break; }');
+  h.push('  }');
+  h.push('  var target = memo ? !memo.expanded : true;');
+  h.push('  setMemoLocalExpanded(id, target, isHidden);');
   h.push('  try {');
-  h.push('    var res = await fetch("/api/memos/" + id + "/expand", { method: "PUT" });');
+  h.push('    var res = await fetch("/api/memos/" + id + "/expand", {');
+  h.push('      method: "PUT",');
+  h.push('      headers: { "Content-Type": "application/json" },');
+  h.push('      body: JSON.stringify({ expanded: target })');
+  h.push('    });');
   h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
-  h.push('    if (!res.ok) updateMemoLocalExpanded(id);');
-  h.push('  } catch(e) { updateMemoLocalExpanded(id); toast("网络错误"); }');
+  h.push('    if (!res.ok) setMemoLocalExpanded(id, !target, isHidden);');
+  h.push('  } catch(e) { setMemoLocalExpanded(id, !target, isHidden); toast("网络错误"); }');
   h.push('}');
   h.push('');
-  h.push('function updateMemoLocalExpanded(id) {');
-  h.push('  for (var i = 0; i < memosCache.length; i++) {');
-  h.push('    if (memosCache[i].id === id) { memosCache[i].expanded = !memosCache[i].expanded; break; }');
+  h.push('function setMemoLocalExpanded(id, expanded, isHidden) {');
+  h.push('  var cache = isHidden ? hiddenMemosCache : memosCache;');
+  h.push('  for (var i = 0; i < cache.length; i++) {');
+  h.push('    if (cache[i].id === id) { cache[i].expanded = expanded; break; }');
   h.push('  }');
   h.push('  renderMemoList();');
   h.push('}');
@@ -2159,10 +2188,10 @@ h.push('function selectFolder(id) {');
   h.push('    });');
   h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
   h.push('    if (res.ok) {');
-  h.push('      var memo = await res.json();');
+h.push('      var memo = await res.json();');
   h.push('      for (var i = 0; i < memosCache.length; i++) {');
-  h.push('        if (memosCache[i].id === memoId) { memosCache[i] = memo; break; }');
-  h.push('      }');
+h.push('        if (memosCache[i].id === memoId) { var prevExpanded = memosCache[i].expanded; memosCache[i] = memo; memosCache[i].expanded = prevExpanded; break; }');
+h.push('      }');
   h.push('      renderMemoList();');
   h.push('      renderFolderList();');
   h.push('    } else { toast("移动失败"); }');

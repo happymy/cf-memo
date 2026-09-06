@@ -266,7 +266,9 @@ describe("Expand/Collapse", () => {
     let list = await (await authedFetch("/api/memos")).json();
     expect(list.find(x => x.id === created.id).expanded).toBe(false);
 
-    const res = await authedFetch(`/api/memos/${created.id}/expand`, { method: "PUT" });
+    const res = await authedFetch(`/api/memos/${created.id}/expand`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expanded: true })
+    });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.expanded).toBe(true);
@@ -274,7 +276,9 @@ describe("Expand/Collapse", () => {
     list = await (await authedFetch("/api/memos")).json();
     expect(list.find(x => x.id === created.id).expanded).toBe(true);
 
-    await authedFetch(`/api/memos/${created.id}/expand`, { method: "PUT" });
+    await authedFetch(`/api/memos/${created.id}/expand`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expanded: false })
+    });
     list = await (await authedFetch("/api/memos")).json();
     expect(list.find(x => x.id === created.id).expanded).toBe(false);
   });
@@ -284,9 +288,34 @@ describe("Expand/Collapse", () => {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: "隐藏折叠" }),
     })).json();
-    await authedFetch(`/api/memos/${created.id}/expand`, { method: "PUT" });
+    await authedFetch(`/api/memos/${created.id}/expand`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expanded: true })
+    });
     const list = await (await hiddenAuthFetch("/api/memos?view=hidden")).json();
     expect(list.find(x => x.id === created.id).expanded).toBe(true);
+  });
+
+  it("expanded 非布尔值返回 400，删除 memo 后不残留展开状态", async () => {
+    const created = await (await authedFetch("/api/memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "清理测试" }),
+    })).json();
+    await authedFetch(`/api/memos/${created.id}/expand`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expanded: true })
+    });
+    const bad = await authedFetch(`/api/memos/${created.id}/expand`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expanded: "yes" })
+    });
+    expect(bad.status).toBe(400);
+
+    const missing = await authedFetch(`/api/memos/nonexistent_id/expand`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expanded: true })
+    });
+    expect(missing.status).toBe(404);
+
+    await authedFetch(`/api/memos/${created.id}`, { method: "DELETE" });
+    const fresh = await (await authedFetch("/api/memos?t=" + Date.now())).json();
+    expect(fresh.find(x => x.id === created.id)).toBeUndefined();
   });
 });
 
