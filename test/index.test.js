@@ -1,5 +1,6 @@
 import { SELF, reset, env } from "cloudflare:test";
 import { describe, it, expect, afterEach } from "vitest";
+import { markdownToHtml } from "../src/index.js";
 
 const BASE = "http://localhost";
 const CRED = { username: "admin", password: "memo2024" };
@@ -531,3 +532,156 @@ describe("Hidden Memo", () => {
     expect(res.status).toBe(401);
   });
 });
+
+// ── Markdown ───
+describe("Markdown", () => {
+  it("标题与行内样式", () => {
+    expect(markdownToHtml("# 标题")).toBe("<h1>标题</h1>");
+    expect(markdownToHtml("### 三级 ###")).toBe("<h3>三级</h3>");
+    expect(markdownToHtml("**粗** *斜* ~~删~~ `码`")).toBe(
+      "<p><strong>粗</strong> <em>斜</em> <del>删</del> <code>码</code></p>"
+    );
+  });
+
+  it("下划线变量名不会被误判为斜体", () => {
+    expect(markdownToHtml("snake_case_name")).toBe("<p>snake_case_name</p>");
+  });
+
+  it("段落保留软换行并过滤空行", () => {
+    expect(markdownToHtml("第一行\n第二行\n\n\n第三行")).toBe("<p>第一行<br>第二行</p><p>第三行</p>");
+  });
+
+  it("无序/有序列表与嵌套子列表", () => {
+    expect(markdownToHtml("- a\n- b")).toBe("<ul><li>a</li><li>b</li></ul>");
+    expect(markdownToHtml("1. a\n2. b")).toBe("<ol><li>a</li><li>b</li></ol>");
+    expect(markdownToHtml("- a\n  - b")).toBe("<ul><li><p>a</p><ul><li>b</li></ul></li></ul>");
+  });
+
+  it("任务列表渲染为禁用复选框", () => {
+    expect(markdownToHtml("- [ ] 待办\n- [x] 完成")).toBe(
+      '<ul><li class="task-item"><input type="checkbox" disabled> 待办</li>' +
+      '<li class="task-item"><input type="checkbox" disabled checked> 完成</li></ul>'
+    );
+  });
+
+  it("围栏代码块保留换行与语言标记", () => {
+    expect(markdownToHtml("```js\nconst a = 1 < 2;\n```")).toBe(
+      '<pre><code class="language-js">const a = 1 &lt; 2;</code></pre>'
+    );
+  });
+
+  it("引用与分隔线", () => {
+    expect(markdownToHtml("> 引用\n\n---")).toBe("<blockquote><p>引用</p></blockquote><hr>");
+  });
+
+  it("行内代码内的语法不被解析", () => {
+    expect(markdownToHtml("`**x**`")).toBe("<p><code>**x**</code></p>");
+  });
+
+  it("链接放行 http/https/mailto", () => {
+    expect(markdownToHtml("[站点](https://a.com/x)")).toBe(
+      '<p><a href="https://a.com/x" target="_blank" rel="noopener noreferrer">站点</a></p>'
+    );
+    expect(markdownToHtml("[邮件](mailto:a@b.com)")).toContain('href="mailto:a@b.com"');
+  });
+
+  it("危险协议链接降级为纯文本", () => {
+    expect(markdownToHtml("[点我](javascript:alert(1))")).toBe("<p>点我</p>");
+    expect(markdownToHtml("[点我](&#106;avascript:alert(1))")).toBe("<p>点我</p>");
+    expect(markdownToHtml("[点我](data:text/html,<script>)")).toBe("<p>点我</p>");
+  });
+
+  it("HTML 标签被转义，无法注入脚本", () => {
+    const html = markdownToHtml('<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>');
+    expect(html).not.toContain("<script");
+    expect(html).not.toContain("<img");
+    expect(html).toBe("<p>&lt;script&gt;alert(1)&lt;/script&gt;</p><p>&lt;img src=x onerror=alert(1)&gt;</p>");
+  });
+
+  it("URL 中的引号被转义，无法逃逸属性", () => {
+    const html = markdownToHtml('[a](https://x.com/"onclick="alert(1))');
+    expect(html).not.toContain('"onclick="');
+    expect(html).toContain("&quot;");
+  });
+
+  it("Windows 换行与空内容", () => {
+    expect(markdownToHtml("# A\r\n\r\n- b")).toBe("<h1>A</h1><ul><li>b</li></ul>");
+    expect(markdownToHtml("")).toBe("");
+    expect(markdownToHtml(null)).toBe("");
+  });
+
+  it("分享页按 Markdown 渲染正文", async () => {
+    const created = await (await authedFetch("/api/memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "md", content: "# 标题\n\n- **粗体**\n\n`code`" }),
+    })).json();
+    const share = await (await authedFetch(`/api/memos/${created.id}/share`, { method: "POST" })).json();
+    const text = await (await SELF.fetch(`${BASE}${share.url}`)).text();
+    expect(text).toContain('<div class="content md">');
+    expect(text).toContain("<h1>标题</h1>");
+    expect(text).toContain("<strong>粗体</strong>");
+    expect(text).toContain("<code>code</code>");
+  });
+
+  it("应用页面不含客户端渲染器，展开项直接使用服务端 html", async () => {
+    const created = await (await authedFetch("/api/memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "md", content: "# 标题" }),
+    })).json();
+    const html = await (await authedFetch("/")).text();
+    expect(html).toContain(".md pre code");
+    expect(html).toContain('<div class=\\"md\\">');
+    expect(html).not.toContain("markdownToHtml(");
+
+    // 折叠态列表不渲染 Markdown，展开后才由服务端下发 html
+    const collapsed = await (await authedFetch("/api/memos")).json();
+    expect(collapsed[0].html).toBeUndefined();
+
+    const expanded = await (await authedFetch(`/api/memos/${created.id}/expand`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expanded: true }),
+    })).json();
+    expect(expanded.html).toBe("<h1>标题</h1>");
+
+    const list = await (await authedFetch("/api/memos")).json();
+    expect(list[0].html).toBe("<h1>标题</h1>");
+  });
+
+  it("展开接口对隐藏备忘录同样返回渲染结果", async () => {
+    const { cookie: session } = await login();
+    const hauth = await SELF.fetch(`${BASE}/api/hidden-auth`, {
+      method: "POST", headers: { "Content-Type": "application/json", Cookie: session },
+      body: JSON.stringify({ password: "hidden2026" }),
+    });
+    const hiddenCookie = hauth.headers.get("Set-Cookie");
+    const created = await (await SELF.fetch(`${BASE}/api/hidden-memos`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: `${session}; ${hiddenCookie}` },
+      body: JSON.stringify({ title: "h", content: "- **加粗**" }),
+    })).json();
+    const res = await SELF.fetch(`${BASE}/api/memos/${created.id}/expand`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Cookie: `${session}; ${hiddenCookie}` },
+      body: JSON.stringify({ expanded: true }),
+    });
+    const data = await res.json();
+    expect(data.expanded).toBe(true);
+    expect(data.html).toBe("<ul><li><strong>加粗</strong></li></ul>");
+  });
+
+  it("折叠时展开接口不返回 html", async () => {
+    const created = await (await authedFetch("/api/memos", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "md", content: "# x" }),
+    })).json();
+    const res = await authedFetch(`/api/memos/${created.id}/expand`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expanded: false }),
+    });
+    const data = await res.json();
+    expect(data.expanded).toBe(false);
+    expect(data.html).toBeUndefined();
+  });
+});
+
+

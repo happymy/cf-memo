@@ -470,7 +470,7 @@ async function handleListMemos(user, env) {
   // 按更新时间倒序
   memos.sort((a, b) => b.updatedAt - a.updatedAt);
   const expanded = await loadExpandedIds(env);
-  for (const m of memos) m.expanded = expanded.has(m.id);
+  for (const m of memos) { m.expanded = expanded.has(m.id); if (m.expanded) m.html = markdownToHtml(m.content); }
   return json(memos, 200, { 'Cache-Control': 'private, no-store' });
 }
 
@@ -638,7 +638,7 @@ async function handleListHiddenMemos(env) {
   } while (cursor);
   memos.sort((a, b) => b.updatedAt - a.updatedAt);
   const expanded = await loadExpandedIds(env);
-  for (const m of memos) m.expanded = expanded.has(m.id);
+  for (const m of memos) { m.expanded = expanded.has(m.id); if (m.expanded) m.html = markdownToHtml(m.content); }
   return json(memos, 200, { 'Cache-Control': 'no-store' });
 }
 
@@ -802,7 +802,16 @@ async function handleSetMemoExpanded(request, memoId, env) {
   const key = 'expand:' + memoId;
   if (body.expanded) await env.MEMOS_KV.put(key, '1');
   else await env.MEMOS_KV.delete(key);
-  return json({ ok: true, expanded: body.expanded });
+  // 展开时一并返回渲染后的 Markdown，前端无需内置渲染器
+  let html;
+  if (body.expanded) {
+    if (normal) {
+      try { html = markdownToHtml(JSON.parse(normal).content); } catch { /* 损坏数据忽略 */ }
+    } else {
+      try { html = markdownToHtml((await decryptJson(hidden, env)).content); } catch { /* 解密失败忽略 */ }
+    }
+  }
+  return json({ ok: true, expanded: body.expanded, html });
 }
 
 async function handleStarMemo(memoId, env) {
@@ -934,6 +943,179 @@ async function handleSetHiddenMemo(request, memoId, env) {
   return json(memo, 200, { 'Cache-Control': 'no-store' });
 }
 
+// ── 极简 Markdown 渲染 ───────────────────────────────────────────
+// 策略：先整体转义 HTML，再套用语法标签，天然免疫 XSS；
+// 链接仅放行 http/https/mailto，其余降级为纯文本。
+// 注意：渲染统一在服务端完成（列表接口对展开项返回 html，分享页直接渲染），
+// 前端不内置渲染器，Markdown 语法永远不会作为 HTML 注入。
+export function markdownToHtml(src) {
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // 链接只放行 http/https/mailto（判定在转义之后，实体无法伪装协议）
+  function link(url, label) {
+    return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + label + '</a>';
+  }
+
+  function inline(text) {
+    // 行内代码先摘出为占位符，避免内部符号被当作语法解析
+    var codes = [];
+    var s = String(text).replace(/`([^`\n]+)`/g, function (_, c) {
+      codes.push(c);
+      return '\u0000' + (codes.length - 1) + '\u0000';
+    });
+    s = esc(s);
+    // 图片降级为链接（页面 CSP 禁止外链图片），避免残留感叹号
+    s = s.replace(/!\[([^\]\n]*)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g, function (_, alt, url) {
+      return /^(https?:\/\/)/i.test(url) ? link(url, alt || url) : (alt || url);
+    });
+    s = s.replace(/\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g, function (_, label, url) {
+      return /^(https?:\/\/|mailto:)/i.test(url) ? link(url, label) : label;
+    });
+    s = s.replace(/\*\*\*([^*\n]+)\*\*\*/g, '<strong><em>$1</em></strong>');
+    s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*\w])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    s = s.replace(/(^|[^_\w])_([^_\n]+)_/g, '$1<em>$2</em>');
+    s = s.replace(/~~([^\n]+)~~/g, '<del>$1</del>');
+    return s.replace(/\u0000(\d+)\u0000/g, function (_, i) { return '<code>' + esc(codes[i]) + '</code>'; });
+  }
+
+  function startsBlock(line) {
+    return /^\s*(`{3,}|~{3,})/.test(line) || /^#{1,6}\s/.test(line) ||
+      /^\s*([-*_])\s*(\1\s*){2,}$/.test(line) || /^\s*>/.test(line) ||
+      /^\s*(?:[-*+]|\d+[.)])\s+/.test(line);
+  }
+
+  function render(text) {
+    var lines = String(text).replace(/\r\n?/g, '\n').split('\n');
+    var out = '';
+    var i = 0;
+    while (i < lines.length) {
+      var line = lines[i];
+      if (!line.trim()) { i++; continue; }
+
+      // 围栏代码块 ``` / ~~~
+      var fence = line.match(/^\s*(`{3,}|~{3,})\s*(\S*)\s*$/);
+      if (fence) {
+        var mark = fence[1][0];
+        var minLen = fence[1].length;
+        var buf = [];
+        i++;
+        while (i < lines.length) {
+          var close = lines[i].match(/^\s*(`{3,}|~{3,})\s*$/);
+          if (close && close[1][0] === mark && close[1].length >= minLen) { i++; break; }
+          buf.push(lines[i]);
+          i++;
+        }
+        out += '<pre><code' + (fence[2] ? ' class="language-' + esc(fence[2]) + '"' : '') + '>' + esc(buf.join('\n')) + '</code></pre>';
+        continue;
+      }
+
+      // 标题 # ~ ######
+      var head = line.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/);
+      if (head) {
+        var lv = head[1].length;
+        out += '<h' + lv + '>' + inline(head[2]) + '</h' + lv + '>';
+        i++;
+        continue;
+      }
+
+      // 分隔线 --- / *** / ___
+      if (/^\s{0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/.test(line)) { out += '<hr>'; i++; continue; }
+
+      // 引用 >
+      if (/^\s{0,3}>/.test(line)) {
+        var quoted = [];
+        while (i < lines.length && /^\s{0,3}>/.test(lines[i])) { quoted.push(lines[i].replace(/^\s{0,3}>\s?/, '')); i++; }
+        out += '<blockquote>' + render(quoted.join('\n')) + '</blockquote>';
+        continue;
+      }
+
+      // 列表 - * + / 1. 2)（支持缩进嵌套、续行与 - [ ] 任务项）
+      if (/^\s*(?:[-*+]|\d+[.)])\s+/.test(line)) {
+        var ordered = /^\s{0,3}\d+[.)]\s+/.test(line);
+        var base = line.match(/^(\s*)/)[1].length;
+        var items = [];
+        var cur = null;
+        while (i < lines.length) {
+          var l = lines[i];
+          if (!l.trim()) {
+            // 空行后仍是同级同类型列表项 → 同一列表内的松弛分隔，否则列表结束
+            var j = i + 1;
+            while (j < lines.length && !lines[j].trim()) j++;
+            var nx = j < lines.length ? lines[j].match(/^(\s*)([-*+]|\d+[.)])\s+/) : null;
+            if (nx && nx[1].length <= base && /^\d/.test(nx[2]) === ordered) { if (cur) cur.push(''); i = j; continue; }
+            break;
+          }
+          if (/^\s*(`{3,}|~{3,})/.test(l)) { if (cur) cur.push(l); i++; continue; }  // 列表内代码块
+          var item = l.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+          if (item) {
+            if (item[1].length <= base) {
+              if (cur && /^\d/.test(item[2]) !== ordered) break;  // 有序/无序切换 → 结束当前列表
+              cur = [item[3]];
+              items.push(cur);
+            } else {
+              if (!cur) break;
+              cur.push(l.replace(/^\s+/, ''));  // 更深缩进 → 归入上一项，内部递归渲染为子列表
+            }
+            i++;
+            continue;
+          }
+          if (!cur) break;
+          cur.push(l.replace(/^\s{1,4}/, ''));  // 缩进续行
+          i++;
+        }
+        var tag = ordered ? 'ol' : 'ul';
+        out += '<' + tag + '>' + items.map(function (ls) {
+          var task = ls[0].match(/^\[([ xX])\][ \t]+(.*)$/);
+          if (task) ls[0] = task[2];
+          var body = render(ls.join('\n'));
+          // 单段落列表项去掉 <p> 包裹，含子块时保留段落结构
+          if (/^<p>[\s\S]*<\/p>$/.test(body) && !/<(ul|ol|pre|blockquote|hr|h[1-6])\b/.test(body)) body = body.slice(3, -4);
+          if (task) body = '<input type="checkbox" disabled' + (task[1] === ' ' ? '' : ' checked') + '> ' + body;
+          return '<li' + (task ? ' class="task-item"' : '') + '>' + body + '</li>';
+        }).join('') + '</' + tag + '>';
+        continue;
+      }
+
+      // 段落（连续非空行，保留软换行）
+      var para = [line];
+      i++;
+      while (i < lines.length && lines[i].trim() && !startsBlock(lines[i])) { para.push(lines[i]); i++; }
+      out += '<p>' + inline(para.join('\n')).replace(/\n/g, '<br>') + '</p>';
+    }
+    return out;
+  }
+
+  return src ? render(src) : '';
+}
+
+// Markdown 正文样式，主页面与分享页共用（挂在 .md 容器下，避免污染页面其它元素）
+const MD_CSS = `
+  .md > *:first-child { margin-top: 0; }
+  .md > *:last-child { margin-bottom: 0; }
+  .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { color: var(--text); font-weight: 600; line-height: 1.35; margin: 1em 0 .5em; }
+  .md h1 { font-size: 1.4em; }
+  .md h2 { font-size: 1.25em; }
+  .md h3 { font-size: 1.12em; }
+  .md h4, .md h5, .md h6 { font-size: 1em; }
+  .md p { margin: 0 0 .7em; }
+  .md ul, .md ol { margin: 0 0 .7em; padding-left: 1.5em; }
+  .md li { margin: .2em 0; }
+  .md ul { list-style: disc; }
+  .md ul ul { list-style: circle; }
+  .md li.task-item { list-style: none; margin-left: -1.2em; }
+  .md li.task-item input { margin-right: .45em; vertical-align: middle; }
+  .md a { color: var(--primary); word-break: break-all; }
+  .md hr { border: none; border-top: 1px solid var(--border); margin: 1em 0; }
+  .md blockquote { margin: 0 0 .7em; padding: .1em .9em; border-left: 3px solid var(--border); color: var(--text-secondary); }
+  .md code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; background: var(--surface-hover); border: 1px solid var(--border); border-radius: 4px; padding: .1em .35em; }
+  .md pre { margin: 0 0 .7em; padding: .7em .9em; background: var(--surface-hover); border: 1px solid var(--border); border-radius: 8px; overflow-x: auto; }
+  .md pre code { background: none; border: none; border-radius: 0; padding: 0; font-size: .85em; line-height: 1.6; white-space: pre; }
+  .md del { color: var(--text-secondary); }
+`;
+
 function serveSharePage(token, env) {
   return env.MEMOS_KV.get('share:' + token).then(function(memoId) {
     if (!memoId) {
@@ -953,9 +1135,9 @@ function serveSharePage(token, env) {
       }
       var title = memo.title || '备忘录';
       var safeTitle = title.replace(/</g, '&lt;');
-      var content = (memo.content || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      var content = markdownToHtml(memo.content);
       var time = new Date(memo.updatedAt).toLocaleString('zh-CN');
-      var html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" id="themeColor" content="#ffffff"><link rel="icon" href="data:image/svg+xml,<svg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27><text y=%27.9em%27 font-size=%2790%27>📝</text></svg>"><title>' + safeTitle + '</title><style>:root{--bg:#fff;--text:#333;--text-secondary:#999;--surface:#f5f5f7;--border:#e5e5e7;--primary:#667eea;--primary-hover:#5a6fd6}[data-theme=dark]{--bg:#1a1a2e;--text:#e0e0e0;--text-secondary:#888;--surface:#16213e;--border:#2a2a4a;--primary:#7c8cf0;--primary-hover:#6a7be0}@media(prefers-color-scheme:dark){:root:not([data-theme]){--bg:#1a1a2e;--text:#e0e0e0;--text-secondary:#888;--surface:#16213e;--border:#2a2a4a;--primary:#7c8cf0;--primary-hover:#6a7be0}}body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:720px;margin:0 auto;padding:24px 20px;color:var(--text);background:var(--bg);line-height:1.7;transition:color .2s,background .2s}h1{font-size:22px;margin-bottom:8px}.content{font-size:15px;white-space:pre-wrap;margin-bottom:24px;word-break:break-word;color:var(--text)}.time{color:var(--text-secondary);font-size:12px;margin-bottom:32px}.theme-btn{position:fixed;top:16px;right:16px;width:36px;height:36px;border:none;border-radius:8px;background:var(--surface);color:var(--text);font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);transition:all .15s;z-index:10}.theme-btn:hover{background:var(--border)}.copy-btn{display:inline-block;padding:10px 24px;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;transition:background .15s}.copy-btn:hover{background:var(--primary-hover)}</style></head><body><button class="theme-btn" id="themeBtn" title="切换主题">🌙</button><h1>' + safeTitle + '</h1><div class="time">更新于 ' + time.replace(/</g, '&lt;') + '</div><div class="content">' + content + '</div><button class="copy-btn" id="copyBtn">复制全文</button><script>(function(){var t=document.documentElement,s=localStorage.getItem("share-theme"),m=window.matchMedia("(prefers-color-scheme:dark)");function a(){var n=localStorage.getItem("share-theme");if(n)t.setAttribute("data-theme",n);else t.removeAttribute("data-theme");var e=document.getElementById("themeColor"),o=getComputedStyle(t).getPropertyValue("--bg").trim();if(e)e.content=o||"#fff";var c=document.getElementById("themeBtn");if(c){var u=n?n==="dark":m.matches;c.textContent=u?"☀️":"🌙"}}a();m.addEventListener("change",a);document.getElementById("themeBtn").addEventListener("click",function(){var n=localStorage.getItem("share-theme");if(!n||n==="light")localStorage.setItem("share-theme","dark");else if(n==="dark")localStorage.setItem("share-theme","light");a()});document.getElementById("copyBtn").addEventListener("click",function(){var t=document.querySelector("h1").textContent+"\\n"+document.querySelector(".content").textContent;navigator.clipboard.writeText(t).then(function(){this.textContent="已复制"}.bind(this),function(){this.textContent="复制失败"}.bind(this))});})();</script></body></html>';
+      var html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" id="themeColor" content="#ffffff"><link rel="icon" href="data:image/svg+xml,<svg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27><text y=%27.9em%27 font-size=%2790%27>📝</text></svg>"><title>' + safeTitle + '</title><style>:root{--bg:#fff;--text:#333;--text-secondary:#999;--surface:#f5f5f7;--surface-hover:#ececf1;--border:#e5e5e7;--primary:#667eea;--primary-hover:#5a6fd6}[data-theme=dark]{--bg:#1a1a2e;--text:#e0e0e0;--text-secondary:#888;--surface:#16213e;--surface-hover:#1f2a49;--border:#2a2a4a;--primary:#7c8cf0;--primary-hover:#6a7be0}@media(prefers-color-scheme:dark){:root:not([data-theme]){--bg:#1a1a2e;--text:#e0e0e0;--text-secondary:#888;--surface:#16213e;--surface-hover:#1f2a49;--border:#2a2a4a;--primary:#7c8cf0;--primary-hover:#6a7be0}}body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:720px;margin:0 auto;padding:24px 20px;color:var(--text);background:var(--bg);line-height:1.7;transition:color .2s,background .2s}h1{font-size:22px;margin-bottom:8px}.content{font-size:15px;margin-bottom:24px;word-break:break-word;color:var(--text)}' + MD_CSS + '.time{color:var(--text-secondary);font-size:12px;margin-bottom:32px}.theme-btn{position:fixed;top:16px;right:16px;width:36px;height:36px;border:none;border-radius:8px;background:var(--surface);color:var(--text);font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);transition:all .15s;z-index:10}.theme-btn:hover{background:var(--border)}.copy-btn{display:inline-block;padding:10px 24px;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;transition:background .15s}.copy-btn:hover{background:var(--primary-hover)}</style></head><body><button class="theme-btn" id="themeBtn" title="切换主题">🌙</button><h1>' + safeTitle + '</h1><div class="time">更新于 ' + time.replace(/</g, '&lt;') + '</div><div class="content md">' + content + '</div><button class="copy-btn" id="copyBtn">复制全文</button><script>(function(){var t=document.documentElement,s=localStorage.getItem("share-theme"),m=window.matchMedia("(prefers-color-scheme:dark)");function a(){var n=localStorage.getItem("share-theme");if(n)t.setAttribute("data-theme",n);else t.removeAttribute("data-theme");var e=document.getElementById("themeColor"),o=getComputedStyle(t).getPropertyValue("--bg").trim();if(e)e.content=o||"#fff";var c=document.getElementById("themeBtn");if(c){var u=n?n==="dark":m.matches;c.textContent=u?"☀️":"🌙"}}a();m.addEventListener("change",a);document.getElementById("themeBtn").addEventListener("click",function(){var n=localStorage.getItem("share-theme");if(!n||n==="light")localStorage.setItem("share-theme","dark");else if(n==="dark")localStorage.setItem("share-theme","light");a()});document.getElementById("copyBtn").addEventListener("click",function(){var t=document.querySelector("h1").textContent+"\\n"+document.querySelector(".content").textContent;navigator.clipboard.writeText(t).then(function(){this.textContent="已复制"}.bind(this),function(){this.textContent="复制失败"}.bind(this))});})();</script></body></html>';
       return new Response(html, {
         status: 200,
         headers: {
@@ -1341,7 +1523,9 @@ function serveAppPage() {
   h.push('  .expand-toggle:hover { color:var(--primary); }');
   h.push('  .memo-card h3 { margin-bottom:8px; font-size:16px; color:var(--text); display:flex; align-items:center; gap:8px; }');
   h.push('  .memo-card h3 .memo-folder { font-size:11px; color:var(--primary); background:var(--primary-light); padding:1px 8px; border-radius:10px; font-weight:400; }');
-  h.push('  .memo-card p { color:var(--text-secondary); font-size:14px; line-height:1.7; white-space:pre-wrap; }');
+  h.push('  .memo-content { color:var(--text-secondary); font-size:14px; line-height:1.7; word-break:break-word; }');
+  h.push('  .memo-preview { white-space:pre-wrap; }');
+  h.push(MD_CSS);
   h.push('  .memo-card .time { color:var(--text-muted); font-size:11px; margin-top:10px; }');
   h.push('  .memo-card .card-actions { position:absolute; top:16px; right:16px; display:flex; gap:4px; opacity:0; transition:opacity .15s; }');
   h.push('  .memo-card:hover .card-actions { opacity:1; }');
@@ -1523,7 +1707,7 @@ function serveAppPage() {
   h.push('    </div>');
   h.push('    <div class="field">');
   h.push('      <label for="memoContent">内容</label>');
-  h.push('      <textarea id="memoContent" placeholder="输入内容..."></textarea>');
+  h.push('      <textarea id="memoContent" placeholder="输入内容，支持 Markdown（# 标题、**粗体**、- 列表、`代码`）"></textarea>');
   h.push('      <div class="char-count" id="charCount">0 / 20000</div>');
   h.push('    </div>');
   h.push('    <div class="field">');
@@ -1738,10 +1922,10 @@ h.push('');
   h.push('    card += "<h3><button class=\\"expand-toggle\\" data-expand=\\"" + m.id + "\\" title=\\"" + (expanded ? "折叠" : "展开") + "\\">" + (expanded ? "▼" : "▶") + "</button> " + escapeHtml(m.title || "(无标题)") + folderNames + "</h3>";');
   h.push('    card += "<div class=\\"memo-content\\">";');
   h.push('    if (m.content) {');
-  h.push('      if (expanded) card += "<p>" + escapeHtml(m.content) + "</p>";');
-  h.push('      else card += (function(){ var ch = Array.from(m.content); return "<p>" + escapeHtml(ch.length > 100 ? ch.slice(0, 100).join("") : m.content) + (ch.length > 100 ? "…" : "") + "</p>"; })();');
+  h.push('      if (expanded) card += "<div class=\\"md\\">" + (m.html != null ? m.html : escapeHtml(m.content)) + "</div>";');
+  h.push('      else card += (function(){ var ch = Array.from(m.content); return "<p class=\\"memo-preview\\">" + escapeHtml(ch.length > 100 ? ch.slice(0, 100).join("") : m.content) + (ch.length > 100 ? "…" : "") + "</p>"; })();');
   h.push('    } else {');
-  h.push('      card += "<p style=\\"color:#ccc;\\">无内容</p>";');
+  h.push('      card += "<p class=\\"memo-preview\\" style=\\"color:var(--text-muted);\\">无内容</p>";');
   h.push('    }');
   h.push('    card += "</div>";');
   h.push('    card += "<div class=\\"time\\">更新于 " + date + "</div>";');
@@ -1969,6 +2153,8 @@ h.push('            break;');
 h.push('          }');
 h.push('        }');
 h.push('        cache.sort(function(a,b){ return b.updatedAt - a.updatedAt; });');
+h.push('        // 正文变了，之前缓存的渲染结果失效，展开态重新向服务端取一次');
+h.push('        if (prevExpanded) refreshMemoHtml(id, isHidden);');
   h.push('      } else {');
 h.push('        cache.push(memo);');
 h.push('        cache.sort(function(a,b){ return b.updatedAt - a.updatedAt; });');
@@ -2144,8 +2330,33 @@ h.push('      }');
   h.push('      body: JSON.stringify({ expanded: target })');
   h.push('    });');
   h.push('    if (res.status === 401) { window.location.href = "/"; return; }');
-  h.push('    if (!res.ok) setMemoLocalExpanded(id, !target, isHidden);');
+  h.push('    if (!res.ok) { setMemoLocalExpanded(id, !target, isHidden); return; }');
+  h.push('    var data = null;');
+  h.push('    try { data = await res.json(); } catch(e) {}');
+  h.push('    if (data && data.html != null) setMemoHtml(id, data.html, isHidden);');
   h.push('  } catch(e) { setMemoLocalExpanded(id, !target, isHidden); toast("网络错误"); }');
+  h.push('}');
+  h.push('');
+  h.push('function setMemoHtml(id, html, isHidden) {');
+  h.push('  var cache = isHidden ? hiddenMemosCache : memosCache;');
+  h.push('  for (var i = 0; i < cache.length; i++) {');
+  h.push('    if (cache[i].id === id) { cache[i].html = html; break; }');
+  h.push('  }');
+  h.push('  renderMemoList();');
+  h.push('}');
+  h.push('');
+  h.push('// 展开接口幂等：复用它刷新正文变更后的渲染结果');
+  h.push('async function refreshMemoHtml(id, isHidden) {');
+  h.push('  try {');
+  h.push('    var res = await fetch("/api/memos/" + id + "/expand", {');
+  h.push('      method: "PUT",');
+  h.push('      headers: { "Content-Type": "application/json" },');
+  h.push('      body: JSON.stringify({ expanded: true })');
+  h.push('    });');
+  h.push('    if (!res.ok) return;');
+  h.push('    var data = await res.json();');
+  h.push('    if (data && data.html != null) setMemoHtml(id, data.html, isHidden);');
+  h.push('  } catch(e) { /* 保留降级纯文本展示 */ }');
   h.push('}');
   h.push('');
   h.push('function setMemoLocalExpanded(id, expanded, isHidden) {');

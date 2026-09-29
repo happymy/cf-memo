@@ -10,6 +10,7 @@
 - **文件夹分类** — 创建/重命名/删除文件夹，支持批量分类（多选），拖拽移动备忘录到文件夹
 - **星标收藏** — 标记重要备忘录，快速筛选星标条目
 - **折叠/展开** — 长文摘要截断（码点安全），展开状态按条目持久化到 KV
+- **Markdown 支持** — 展开态与分享页按 Markdown 渲染：标题、粗体/斜体/删除线、行内代码、围栏代码块、有序/无序/任务列表（含嵌套）、引用、分隔线、链接；折叠态仍为纯文本摘要
 - **隐藏备忘录** — 用 `HIDDEN_PASSWORD` 加密隐藏，正文以 AES-GCM 加密存储，需额外密码进入隐藏视图
 - **公开分享** — 生成分享链接，支持取消分享，分享页自动跟随系统深色模式
 - **批量操作** — 批量选中后一键分享/取消分享/删除
@@ -126,7 +127,7 @@ npm test         # 等价于: npx vitest
 | `POST` | `/api/login` | ❌ | 登录，body: `{ username, password }` |
 | `POST` | `/api/logout` | ✅ | 登出，清除 Session Cookie |
 | `GET` | `/api/me` | ✅ | 获取当前登录用户信息 |
-| `GET` | `/api/memos` | ✅ | 获取所有备忘录列表，`?view=hidden` 返回隐藏备忘录 |
+| `GET` | `/api/memos` | ✅ | 获取所有备忘录列表，`?view=hidden` 返回隐藏备忘录；展开条目附带 `html`（服务端渲染的 Markdown） |
 | `POST` | `/api/memos` | ✅ | 新建备忘录，body: `{ title, content, folderIds? }` |
 | `PUT` | `/api/memos/:id` | ✅ | 更新指定备忘录，body: `{ title, content, folderIds?, shareToken? }` |
 | `DELETE` | `/api/memos/:id` | ✅ | 删除指定备忘录 |
@@ -145,7 +146,7 @@ npm test         # 等价于: npx vitest
 | `PUT` | `/api/memos/:id/star` | ✅ | 切换星标状态 |
 | `POST` | `/api/memos/:id/share` | ✅ | 开启分享，返回 `{ url, shareToken }` |
 | `DELETE` | `/api/memos/:id/share` | ✅ | 取消分享 |
-| `PUT` | `/api/memos/:id/expand` | ✅ | 设置展开状态，body: `{ expanded }`，返回 `{ ok, expanded }` |
+| `PUT` | `/api/memos/:id/expand` | ✅ | 设置展开状态，body: `{ expanded }`，返回 `{ ok, expanded, html }`（展开时附服务端渲染的 Markdown HTML） |
 | `GET` | `/share/:token` | ❌ | 公开分享页面（无需认证） |
 
    > 未认证请求返回 `401 Unauthorized`；未登录用户访问页面会看到登录界面。
@@ -153,17 +154,19 @@ npm test         # 等价于: npx vitest
 ## 技术实现
 
 - **运行时**: Cloudflare Workers (ES Modules)
+- **Markdown**: 自研极简渲染器 `markdownToHtml()`（无第三方依赖），**先整体转义 HTML 再套语法标签**，天然免疫 XSS；链接仅放行 `http/https/mailto`（`javascript:`、`data:` 等降级为纯文本），行内代码以占位符隔离、内部语法不被解析。渲染统一在服务端完成：展开条目由列表/展开接口下发 `html`，分享页直接渲染，前端不内置渲染器
 - **存储**: Cloudflare KV（`memo:<UUID>` 存储普通备忘录，`sc:<UUID>` 存储隐藏/分享/星标等加密备忘录，`folder:<UUID>` 存储文件夹，`share:<token>` 记录分享映射，`expand:<memoId>` 存储展开状态）
 - **认证**: 自定义 Session 令牌 = `用户名:时间戳:HMAC-SHA256签名`，无外部依赖；隐藏视图另设密码，隐藏会话 Cookie 独立存储
 - **加密**: 隐藏备忘录正文使用 Web Crypto `AES-GCM` 加密（密钥来自 `MEMO_ENCRYPT_KEY`），数据库层面额外防护
 - **缓存**: 列表接口返回 `Cache-Control: no-store`，前端所有列表请求显式禁用缓存，避免浏览器 HTTP 缓存导致空列表/陈旧数据
 - **前端**: 原生 HTML/CSS/JS，无框架，侧边栏按文件夹筛选，支持拖拽分类、切换芯片选分类、键盘快捷键；点击卡片任意位置打开编辑
-- **测试**: Vitest + 模拟 KV 环境，41 个测试覆盖核心接口
+- **测试**: Vitest + 模拟 KV 环境，58 个测试覆盖核心接口
 
 ## 版本历史
 
 | 版本 | 说明 |
 |------|------|
+| `V1.1.5` | 新增 Markdown 简单支持：展开态与分享页按 MD 渲染，服务端统一渲染并下发 `html`，链接协议白名单防 XSS |
 | `V1.1.4` | 备忘录折叠/展开功能，展开状态按条目持久化 KV；编辑/星标/移动分类保留展开状态；展开接口校验 memo 存在性 |
 | `V1.1.3` | 搜索无结果提示覆盖全部分类；「打开编辑」兜底请求统一 no-store 缓存策略 |
 | `V1.1.2` | 完善 wrangler.toml 配置说明与 vars 示例 |
